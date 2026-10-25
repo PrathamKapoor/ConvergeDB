@@ -1,0 +1,41 @@
+# Runtime artifacts
+var/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Dependencies / builds
+node_modules/
+web/dist/
+dist/
+build/
+
+# Env & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+credentials*.json
+service-account*.json
+secrets*.json
+
+# Caches / IDE / OS
+coverage/
+.coverage
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Go
+*.test
+*.out
