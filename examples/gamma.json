@@ -1,0 +1,12 @@
+{
+  "id": "gamma",
+  "db": "var/gamma.db",
+  "http": "127.0.0.1:8103",
+  "lab": true,
+  "sync_interval_ms": 1000,
+  "fault_seed": 42,
+  "peers": [
+    { "id": "alpha", "url": "http://127.0.0.1:8101" },
+    { "id": "beta", "url": "http://127.0.0.1:8102" }
+  ]
+}

@@ -41,6 +41,7 @@ func cmdServe(args []string) error {
 	peers := fs.String("peers", "", "comma list id=url[,id=url...]")
 	lab := fs.Bool("lab", false, "enable lab fault-injection endpoints (localhost use only)")
 	token := fs.String("token", "", "require this bearer token on all non-health endpoints")
+	allowUnsafe := fs.Bool("allow-unsafe-bind", false, "permit non-loopback bind without a token (for containerized multi-node labs only; documented in docs/SECURITY.md)")
 	interval := fs.Int("sync-interval-ms", 1000, "anti-entropy interval in milliseconds")
 	seed := fs.Int64("fault-seed", 1, "seed for reproducible fault injection")
 	web := fs.String("web", "", "serve the built web workbench from this directory")
@@ -103,8 +104,8 @@ func cmdServe(args []string) error {
 	}
 	if !strings.HasPrefix(cfg.HTTPAddr, "127.0.0.1") && !strings.HasPrefix(cfg.HTTPAddr, "localhost") && !strings.HasPrefix(cfg.HTTPAddr, "[::1]") {
 		// Safety baseline: refuse unsafe default public binding.
-		if cfg.AuthToken == "" {
-			return fmt.Errorf("refusing to bind %q without an auth token; ConvergeDB supports trusted-localhost by default, or pass --token for authenticated non-loopback use", cfg.HTTPAddr)
+		if cfg.AuthToken == "" && !(*allowUnsafe) {
+			return fmt.Errorf("refusing to bind %q without an auth token; ConvergeDB supports trusted-localhost by default, or pass --token for authenticated non-loopback use (containers may pass --allow-unsafe-bind)", cfg.HTTPAddr)
 		}
 	}
 

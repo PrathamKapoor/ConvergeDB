@@ -1,0 +1,25 @@
+# ConvergeDB three-replica laboratory. alpha serves the web workbench.
+# Data lives in named volumes; `docker compose down -v` removes it.
+services:
+  alpha:
+    build: .
+    command: serve --id alpha --db /data/alpha.db --http 0.0.0.0:8101 --lab --allow-unsafe-bind --web /opt/convergedb-web
+      --peers "beta=http://beta:8102,gamma=http://gamma:8103" --sync-interval-ms 300
+    ports: ["8101:8101"]
+    volumes: ["alpha-data:/data"]
+  beta:
+    build: .
+    command: serve --id beta --db /data/beta.db --http 0.0.0.0:8102 --lab --allow-unsafe-bind
+      --peers "alpha=http://alpha:8101,gamma=http://gamma:8103" --sync-interval-ms 300
+    ports: ["8102:8102"]
+    volumes: ["beta-data:/data"]
+  gamma:
+    build: .
+    command: serve --id gamma --db /data/gamma.db --http 0.0.0.0:8103 --lab --allow-unsafe-bind
+      --peers "alpha=http://alpha:8101,beta=http://beta:8102" --sync-interval-ms 300
+    ports: ["8103:8103"]
+    volumes: ["gamma-data:/data"]
+volumes:
+  alpha-data:
+  beta-data:
+  gamma-data:
