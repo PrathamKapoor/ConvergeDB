@@ -78,7 +78,18 @@ func (s *Store) AppendLocal(op *core.Operation, issued clock.HLC) error {
 	if err := setMetaTx(tx, "hlc_counter", strconv.FormatInt(issued.Counter, 10)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invMu.Lock()
+	a := s.inv[op.Actor]
+	if a == nil {
+		a = newActorState()
+		s.inv[op.Actor] = a
+	}
+	a.observe(op.ActorSeq, InventoryHoleCap)
+	s.invMu.Unlock()
+	return nil
 }
 
 // IngestResult classifies a remote ingest outcome.
@@ -186,7 +197,94 @@ func (s *Store) IngestRemote(op core.Operation, origin string) (IngestOutcome, e
 	if err := tx.Commit(); err != nil {
 		return IngestOutcome{OpID: op.OpID}, err
 	}
+	s.invMu.Lock()
+	a := s.inv[op.Actor]
+	if a == nil {
+		a = newActorState()
+		s.inv[op.Actor] = a
+	}
+	a.observe(op.ActorSeq, InventoryHoleCap)
+	s.invMu.Unlock()
 	return IngestOutcome{Result: IngestAccepted, OpID: op.OpID}, nil
+}
+
+// CheckpointData is a loaded checkpoint with its verification outcome.
+type CheckpointData struct {
+	Covered       map[string]uint64
+	State         []byte
+	Valid         bool
+	InvalidReason string
+}
+
+// SaveCheckpoint atomically records the materializer checkpoint for the
+// given per-actor coverage watermarks.
+func (s *Store) SaveCheckpoint(covered map[string]uint64, state []byte) error {
+	sum := sha256.Sum256(state)
+	coveredJSON, err := json.Marshal(covered)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO checkpoint (id, protocol_version, covered, state, state_sha256, created_ms)
+		VALUES (1, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET protocol_version=excluded.protocol_version, covered=excluded.covered,
+			state=excluded.state, state_sha256=excluded.state_sha256, created_ms=excluded.created_ms`,
+		core.ProtocolVersion, string(coveredJSON), string(state), hex.EncodeToString(sum[:]), time.Now().UnixMilli())
+	return err
+}
+
+// LoadCheckpoint returns the stored checkpoint after verifying (a) its own
+// integrity hash and (b) that the durable log still contains exactly the
+// dense per-actor prefixes the checkpoint claims to cover. Any mismatch or
+// absence yields Valid=false with a reason; callers must fall back to full
+// replay in that case. The count check is an indexed aggregate over the
+// covered prefix — far cheaper than decoding operations.
+func (s *Store) LoadCheckpoint() (CheckpointData, error) {
+	var cd CheckpointData
+	var protocolVersion int
+	var coveredJSON, state, shaHex string
+	var createdMS int64
+	err := s.db.QueryRow(`SELECT protocol_version, covered, state, state_sha256, created_ms
+		FROM checkpoint WHERE id = 1`).Scan(&protocolVersion, &coveredJSON, &state, &shaHex, &createdMS)
+	if err == sql.ErrNoRows {
+		cd.InvalidReason = "no checkpoint"
+		return cd, nil
+	}
+	if err != nil {
+		return cd, err
+	}
+	sum := sha256.Sum256([]byte(state))
+	if hex.EncodeToString(sum[:]) != shaHex {
+		cd.InvalidReason = "checkpoint state hash mismatch (corruption)"
+		return cd, nil
+	}
+	if protocolVersion != core.ProtocolVersion {
+		cd.InvalidReason = fmt.Sprintf("checkpoint protocol %d != %d", protocolVersion, core.ProtocolVersion)
+		return cd, nil
+	}
+	if err := json.Unmarshal([]byte(coveredJSON), &cd.Covered); err != nil {
+		cd.InvalidReason = "covered watermark undecodable"
+		return cd, nil
+	}
+	// Prefix verification: for each covered actor, the log must hold EXACTLY
+	// covered[actor] rows with seq <= covered[actor] (seqs are dense from 1
+	// and append-only, so the prefix is immutable).
+	for actor, frontier := range cd.Covered {
+		if frontier == 0 {
+			continue
+		}
+		var n int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM operations WHERE actor = ? AND actor_seq <= ?`,
+			actor, frontier).Scan(&n); err != nil {
+			return cd, err
+		}
+		if uint64(n) != frontier {
+			cd.InvalidReason = fmt.Sprintf("covered prefix mismatch for %s: log has %d rows <= %d", actor, n, frontier)
+			return cd, nil
+		}
+	}
+	cd.Valid = true
+	cd.State = []byte(state)
+	return cd, nil
 }
 
 func setMetaTx(tx *sql.Tx, key, value string) error {
@@ -244,6 +342,48 @@ func (s *Store) AllOps() ([]core.Operation, error) {
 	return ops, rows.Err()
 }
 
+// AllOpsTail returns operations NOT covered by the given per-actor dense
+// watermarks (seq > covered[actor]), in (actor, seq) order. Used to replay
+// only the tail after a checkpoint restore. Under-coverage is safe: CRDT
+// merges are idempotent, so a re-applied tail op is a no-op.
+func (s *Store) AllOpsTail(covered map[string]uint64) ([]core.Operation, error) {
+	s.invMu.Lock()
+	actors := make([]string, 0, len(s.inv))
+	for actor := range s.inv {
+		actors = append(actors, actor)
+	}
+	s.invMu.Unlock()
+	sort.Strings(actors)
+	var ops []core.Operation
+	for _, actor := range actors {
+		lo := covered[actor] // 0 when absent: full actor history
+		rows, err := s.db.Query(`SELECT canonical, checksum FROM operations
+			WHERE actor = ? AND actor_seq > ? ORDER BY actor_seq`, actor, lo)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var c, cs string
+			if err := rows.Scan(&c, &cs); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			op, err := decodeStoredOp(c, cs)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			ops = append(ops, op)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return ops, nil
+}
+
 // OpCount returns the number of stored operations.
 func (s *Store) OpCount() (int, error) {
 	var n int
@@ -291,16 +431,54 @@ type ActorInventory struct {
 	Partial       bool     `json:"partial"` // ReceivedAbove was truncated to the cap
 }
 
-// Inventory computes the local per-actor inventory. receivedAboveCap bounds
-// the hole list; when more holes exist, Partial is set and peers must fall
-// back to resending the whole (frontier, max_seen] range for that actor.
+// Inventory returns the local per-actor inventory from the incremental
+// in-memory state (O(actors) per call). The state is maintained on every
+// accepted operation; TestIncrementalInventoryMatchesScan proves it stays
+// identical to a fresh full-scan computation.
+//
+// receivedAboveCap bounds the advertised hole list; when more holes exist,
+// Partial is set and peers fall back to resending the whole
+// (frontier, max_seen] range for that actor.
 func (s *Store) Inventory(receivedAboveCap int) ([]ActorInventory, error) {
+	s.invMu.Lock()
+	defer s.invMu.Unlock()
+	out := make([]ActorInventory, 0, len(s.inv))
+	for actor, a := range s.inv {
+		ai := ActorInventory{
+			Actor:         actor,
+			Frontier:      a.frontier,
+			MaxSeen:       a.maxSeen,
+			ReceivedAbove: []uint64{},
+		}
+		for seq := range a.receivedAbove {
+			ai.ReceivedAbove = append(ai.ReceivedAbove, seq)
+		}
+		sort.Slice(ai.ReceivedAbove, func(i, j int) bool { return ai.ReceivedAbove[i] < ai.ReceivedAbove[j] })
+		if len(ai.ReceivedAbove) > receivedAboveCap {
+			ai.ReceivedAbove = ai.ReceivedAbove[:receivedAboveCap]
+		}
+		// Partial must be set whenever the TRUE hole count exceeds the
+		// ADVERTISED cap — otherwise a truncated hole list looks complete
+		// and the peer would skip ops it still needs.
+		if a.partial || len(a.receivedAbove) > receivedAboveCap {
+			ai.Partial = true
+		}
+		out = append(out, ai)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Actor < out[j].Actor })
+	return out, nil
+}
+
+// inventoryFromScan recomputes the inventory from the durable rows. It is
+// the verification oracle used by TestIncrementalInventoryMatchesScan and by
+// rebuildInventory at startup.
+func (s *Store) inventoryFromScan(holeCap int) ([]ActorInventory, error) {
 	rows, err := s.db.Query(`SELECT actor, actor_seq FROM operations ORDER BY actor, actor_seq`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	inv := map[string]*ActorInventory{}
+	inv := map[string]*actorState{}
 	for rows.Next() {
 		var actor string
 		var seq uint64
@@ -309,32 +487,31 @@ func (s *Store) Inventory(receivedAboveCap int) ([]ActorInventory, error) {
 		}
 		a := inv[actor]
 		if a == nil {
-			a = &ActorInventory{Actor: actor, Frontier: 0, MaxSeen: 0, ReceivedAbove: []uint64{}}
+			a = newActorState()
 			inv[actor] = a
 		}
-		if seq == a.Frontier+1 {
-			a.Frontier = seq
-			// The frontier advance may close previously-listed holes.
-			for len(a.ReceivedAbove) > 0 && a.ReceivedAbove[0] <= a.Frontier {
-				a.ReceivedAbove = a.ReceivedAbove[1:]
-			}
-		} else {
-			if len(a.ReceivedAbove) >= receivedAboveCap {
-				a.Partial = true
-			} else {
-				a.ReceivedAbove = append(a.ReceivedAbove, seq)
-			}
-		}
-		if seq > a.MaxSeen {
-			a.MaxSeen = seq
-		}
+		a.observe(seq, holeCap)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	out := make([]ActorInventory, 0, len(inv))
-	for _, a := range inv {
-		out = append(out, *a)
+	for actor, a := range inv {
+		ai := ActorInventory{Actor: actor, Frontier: a.frontier, MaxSeen: a.maxSeen, ReceivedAbove: []uint64{}}
+		for seq := range a.receivedAbove {
+			ai.ReceivedAbove = append(ai.ReceivedAbove, seq)
+		}
+		sort.Slice(ai.ReceivedAbove, func(i, j int) bool { return ai.ReceivedAbove[i] < ai.ReceivedAbove[j] })
+		if len(ai.ReceivedAbove) > holeCap {
+			ai.ReceivedAbove = ai.ReceivedAbove[:holeCap]
+		}
+		if a.partial {
+			ai.Partial = true
+		}
+		out = append(out, ai)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Actor < out[j].Actor })
-	return out, rows.Err()
+	return out, nil
 }
 
 // Page is one bounded page of operations offered to a peer.
@@ -345,13 +522,148 @@ type Page struct {
 }
 
 // MissingOpsFor returns the operations a peer with the given inventory is
-// missing, in (actor, seq) order, bounded by limit and resumable via
-// cursor. For each local actor: if the peer sent an inventory entry, every
-// sequence above its frontier that is NOT in its received_above list is
-// sent (the holes); if the peer advertised no entry, everything is sent.
-// A partial hole list forces the safe fallback: resend the full
-// (frontier, max_seen] range.
+// missing, in (actor, seq) order, bounded by limit and resumable via cursor.
+//
+// Implementation: for each LOCAL actor (sorted), compute the candidate range
+// (requester frontier, local max_seen] minus the requester's advertised
+// received-above set (or the full range for a partial/missing entry), split
+// it into contiguous SEGMENTS at the holes, and serve each segment with one
+// indexed range query. Cost per request is O(pages served + holes), not
+// O(entire log): the previous implementation scanned every row on every
+// request, which made per-pull cost grow linearly with log size.
+//
+// Cursor semantics are unchanged: NextCursor encodes the LAST RETURNED op;
+// resume re-examines strictly after it, so nothing between pages is skipped.
 func (s *Store) MissingOpsFor(peerInv []ActorInventory, limit int, cursor string) (Page, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	byActor := map[string]ActorInventory{}
+	for _, a := range peerInv {
+		byActor[a.Actor] = a
+	}
+
+	var afterActor string
+	var afterSeq uint64
+	if cursor != "" {
+		raw, err := base64.StdEncoding.DecodeString(cursor)
+		if err == nil {
+			parts := strings.SplitN(string(raw), ":", 2)
+			if len(parts) == 2 {
+				afterActor = parts[0]
+				afterSeq, _ = strconv.ParseUint(parts[1], 10, 64)
+			}
+		}
+	}
+
+	// Snapshot the local per-actor state (frontier/maxSeen) without holding
+	// the lock during query execution.
+	s.invMu.Lock()
+	actors := make([]string, 0, len(s.inv))
+	local := make(map[string]*actorState, len(s.inv))
+	for actor, a := range s.inv {
+		actors = append(actors, actor)
+		cp := *a
+		cp.receivedAbove = nil
+		local[actor] = &cp
+	}
+	s.invMu.Unlock()
+	sort.Strings(actors)
+
+	page := Page{Ops: []core.Operation{}}
+	for _, actor := range actors {
+		if page.HasMore {
+			break
+		}
+		st := local[actor]
+		var lo uint64 // exclusive lower bound
+		if actor == afterActor {
+			lo = afterSeq
+		} else if actor < afterActor {
+			continue
+		}
+		pi, hasEntry := byActor[actor]
+		if hasEntry && pi.Frontier > lo {
+			lo = pi.Frontier
+		}
+		hi := st.maxSeen
+		if lo >= hi {
+			continue
+		}
+		// Holes to SKIP: sequences the requester already holds above its
+		// frontier. A partial inventory advertises an incomplete hole list,
+		// so the safe fallback is to treat it as empty (full-range resend).
+		var holes []uint64
+		if hasEntry && !pi.Partial {
+			for _, h := range pi.ReceivedAbove {
+				if h > lo && h <= hi {
+					holes = append(holes, h)
+				}
+			}
+			sort.Slice(holes, func(i, j int) bool { return holes[i] < holes[j] })
+		}
+		// Contiguous segments of wanted sequences in (lo, hi].
+		segments := make([][2]uint64, 0, len(holes)+1)
+		next := lo + 1
+		for _, h := range holes {
+			if h > hi {
+				break
+			}
+			if h > next {
+				segments = append(segments, [2]uint64{next, h - 1})
+			}
+			if h >= next {
+				next = h + 1
+			}
+		}
+		if next <= hi {
+			segments = append(segments, [2]uint64{next, hi})
+		}
+
+		for _, seg := range segments {
+			if page.HasMore {
+				break
+			}
+			rows, err := s.db.Query(`SELECT actor_seq, canonical, checksum FROM operations
+				WHERE actor = ? AND actor_seq BETWEEN ? AND ? ORDER BY actor_seq`, actor, seg[0], seg[1])
+			if err != nil {
+				return Page{}, err
+			}
+			for rows.Next() {
+				var seq uint64
+				var canonical, cs string
+				if err := rows.Scan(&seq, &canonical, &cs); err != nil {
+					rows.Close()
+					return Page{}, err
+				}
+				op, err := decodeStoredOp(canonical, cs)
+				if err != nil {
+					rows.Close()
+					return Page{}, err
+				}
+				if len(page.Ops) >= limit {
+					page.HasMore = true
+					last := page.Ops[len(page.Ops)-1]
+					page.NextCursor = encodeCursor(last.Actor, last.ActorSeq)
+					break
+				}
+				page.Ops = append(page.Ops, op)
+			}
+			errRows := rows.Err()
+			rows.Close()
+			if errRows != nil {
+				return Page{}, errRows
+			}
+		}
+	}
+	return page, nil
+}
+
+// MissingOpsForScan is the pre-optimization implementation that scans every
+// row on each request. It is retained as the differential oracle for
+// TestMissingOpsIndexedMatchesScan and as a behavioral reference for the
+// indexed path.
+func (s *Store) MissingOpsForScan(peerInv []ActorInventory, limit int, cursor string) (Page, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 200
 	}
@@ -387,7 +699,6 @@ func (s *Store) MissingOpsFor(peerInv []ActorInventory, limit int, cursor string
 		if err := rows.Scan(&actor, &seq, &canonical, &cs); err != nil {
 			return Page{}, err
 		}
-		// Cursor resume: skip everything up to and including the cursor op.
 		if afterActor != "" {
 			if actor < afterActor || (actor == afterActor && seq <= afterSeq) {
 				continue
@@ -396,7 +707,11 @@ func (s *Store) MissingOpsFor(peerInv []ActorInventory, limit int, cursor string
 		want := false
 		if pi, ok := byActor[actor]; ok {
 			if pi.Partial {
-				want = seq > pi.Frontier && seq <= pi.MaxSeen
+				// Safe fallback: resend everything above the requester's
+				// frontier up to the LOCAL max seen — the requester's own
+				// max_seen may be stale, and ops above it would otherwise
+				// be stranded (it cannot advertise what it never saw).
+				want = seq > pi.Frontier
 			} else {
 				want = seq > pi.Frontier && !containsSeq(pi.ReceivedAbove, seq)
 			}
@@ -411,10 +726,6 @@ func (s *Store) MissingOpsFor(peerInv []ActorInventory, limit int, cursor string
 			return Page{}, err
 		}
 		if len(page.Ops) >= limit {
-			// Resume from the LAST RETURNED op so nothing between pages is
-			// skipped; the next page re-examines rows after it. When the
-			// final page ends exactly at the last row, callers simply get
-			// one empty follow-up page with has_more=false.
 			page.HasMore = true
 			last := page.Ops[len(page.Ops)-1]
 			page.NextCursor = encodeCursor(last.Actor, last.ActorSeq)
@@ -495,3 +806,10 @@ func (s *Store) IdempotencyPut(key, opID, response string) error {
 }
 
 const maxIdempotencyRows = 10000
+
+// ExecRaw executes a raw statement against the store. It exists for
+// administrative tooling and adversarial tests (e.g. simulating checkpoint
+// corruption); application code must never use it.
+func (s *Store) ExecRaw(query string, args ...any) (sql.Result, error) {
+	return s.db.Exec(query, args...)
+}

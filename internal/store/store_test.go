@@ -313,11 +313,13 @@ func TestMissingOpsForIsHoleAware(t *testing.T) {
 	if len(total) != 7 {
 		t.Fatalf("cursor pagination lost ops: %v", total)
 	}
-	// Partial hole list forces the safe full-range resend.
+	// Partial hole list forces the safe full-range resend up to the LOCAL
+	// max seen — seq 7 is included even though the requester's stale
+	// max_seen was 6, because the requester cannot know seq 7 exists.
 	peerPartial := []ActorInventory{{Actor: "alpha", Frontier: 4, MaxSeen: 6, ReceivedAbove: nil, Partial: true}}
 	page, _ = local.MissingOpsFor(peerPartial, 100, "")
-	if len(page.Ops) != 2 { // 5 and 6
-		t.Fatalf("partial fallback expected [5 6], got %d ops", len(page.Ops))
+	if len(page.Ops) != 3 { // 5, 6 and 7
+		t.Fatalf("partial fallback expected [5 6 7], got %d ops", len(page.Ops))
 	}
 }
 

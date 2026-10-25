@@ -26,6 +26,69 @@ const DriverName = "sqlite"
 type Store struct {
 	db *sql.DB
 	mu sync.Mutex // serializes local sequence allocation + appends
+
+	invMu sync.Mutex
+	inv   map[string]*actorState // incremental per-actor receive state
+}
+
+// actorState tracks what this replica holds for one actor: the contiguous
+// frontier, the highest sequence seen, and the out-of-order holes above the
+// frontier. It is maintained incrementally on every accepted operation and
+// rebuilt by one indexed scan at startup; a differential test
+// (TestIncrementalInventoryMatchesScan) proves it stays identical to a fresh
+// full-scan computation.
+type actorState struct {
+	frontier      uint64
+	maxSeen       uint64
+	receivedAbove map[uint64]struct{}
+	partial       bool
+}
+
+func newActorState() *actorState {
+	return &actorState{receivedAbove: map[uint64]struct{}{}}
+}
+
+// observe applies one accepted (actor, seq) to the incremental state.
+func (a *actorState) observe(seq uint64, holeCap int) {
+	if seq > a.maxSeen {
+		a.maxSeen = seq
+	}
+	if seq == a.frontier+1 {
+		a.frontier = seq
+		for {
+			next := a.frontier + 1
+			if _, hole := a.receivedAbove[next]; !hole {
+				break
+			}
+			delete(a.receivedAbove, next)
+			a.frontier = next
+		}
+		return
+	}
+	if seq > a.frontier {
+		if _, seen := a.receivedAbove[seq]; !seen {
+			if len(a.receivedAbove) >= holeCap {
+				a.partial = true
+				// Keep the SMALLEST holeCap holes so the advertised list is
+				// deterministic and identical to a fresh full-scan: evict
+				// the current largest if the new hole is smaller. Overflow
+				// arrivals only happen under pathological reordering; the
+				// eviction scan is bounded by the cap.
+				largest, maxSeq := uint64(0), uint64(0)
+				for h := range a.receivedAbove {
+					if h > maxSeq {
+						maxSeq, largest = h, h
+					}
+				}
+				if seq < maxSeq {
+					delete(a.receivedAbove, largest)
+					a.receivedAbove[seq] = struct{}{}
+				}
+				return
+			}
+			a.receivedAbove[seq] = struct{}{}
+		}
+	}
 }
 
 const dsnPragmas = "_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)&_txlock=immediate"
@@ -48,7 +111,47 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	if err := s.rebuildInventory(InventoryHoleCap); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("rebuild inventory: %w", err)
+	}
+	return s, nil
+}
+
+// InventoryHoleCap bounds the advertised out-of-order hole list per actor.
+const InventoryHoleCap = 512
+
+// rebuildInventory recomputes the incremental per-actor state with one
+// indexed scan. Called once at startup; afterwards state is maintained
+// incrementally.
+func (s *Store) rebuildInventory(holeCap int) error {
+	rows, err := s.db.Query(`SELECT actor, actor_seq FROM operations ORDER BY actor, actor_seq`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	inv := map[string]*actorState{}
+	for rows.Next() {
+		var actor string
+		var seq uint64
+		if err := rows.Scan(&actor, &seq); err != nil {
+			return err
+		}
+		a := inv[actor]
+		if a == nil {
+			a = newActorState()
+			inv[actor] = a
+		}
+		a.observe(seq, holeCap)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	s.invMu.Lock()
+	s.inv = inv
+	s.invMu.Unlock()
+	return nil
 }
 
 // Close closes the underlying database.
@@ -87,6 +190,25 @@ var migrations = []struct {
 				ON operations (actor, actor_seq)`,
 			`CREATE INDEX IF NOT EXISTS idx_operations_doc
 				ON operations (doc_id)`,
+		},
+	},
+	{
+		version: 3,
+		stmts: []string{
+			// Materializer checkpoint: the JSON state of the CRDT
+			// accumulator for the per-actor dense operation prefixes in
+			// `covered`. Append-only logging makes those prefixes immutable,
+			// so a checkpoint can never be invalidated by later writes; its
+			// validity is re-checked against per-actor row counts on load
+			// and ANY mismatch falls back to a full replay.
+			`CREATE TABLE IF NOT EXISTS checkpoint (
+				id               INTEGER PRIMARY KEY CHECK (id = 1),
+				protocol_version INTEGER NOT NULL,
+				covered          TEXT    NOT NULL,
+				state            TEXT    NOT NULL,
+				state_sha256     TEXT    NOT NULL,
+				created_ms       INTEGER NOT NULL
+			)`,
 		},
 	},
 	{

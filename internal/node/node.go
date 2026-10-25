@@ -6,6 +6,7 @@ package node
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -41,6 +42,11 @@ type Config struct {
 	SyncIntervalMS int          `json:"sync_interval_ms"`
 	FaultSeed      int64        `json:"fault_seed"`
 	WebDir         string       `json:"web,omitempty"`
+	// CheckpointEveryOps writes a materializer checkpoint after this many
+	// accepted operations (0 = only on graceful Close). Checkpoints are a
+	// pure startup optimization: a missing/stale/corrupt checkpoint always
+	// falls back to a full deterministic replay.
+	CheckpointEveryOps int `json:"checkpoint_every_ops,omitempty"`
 }
 
 // Node is one ConvergeDB replica.
@@ -55,13 +61,25 @@ type Node struct {
 	faults *FaultController
 	events *EventBus
 
+	httpClient *http.Client
+
 	syncMu   sync.Mutex // one sync exchange per node at a time
 	kickCh   chan struct{}
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
 
-	startMS int64
+	startMS    int64
+	ckptCount  int
+	replayMode string
+
+	// applied tracks the max per-actor sequence ACTUALLY applied to the
+	// world (updated only after a successful apply, under mu). It is the
+	// checkpoint coverage watermark: under-coverage is safe (tail replay is
+	// idempotent); overcoverage would silently skip ops, so coverage is
+	// NEVER derived from the store inventory (which can race world apply).
+	appliedMu sync.RWMutex
+	applied   map[string]uint64
 
 	psMu      sync.Mutex
 	peerState map[string]PeerStatus
@@ -126,18 +144,57 @@ func Open(cfg Config) (*Node, error) {
 	cnt, _ := strconv.ParseInt(cntS, 10, 64)
 	clk := clock.Restore(cfg.ID, clock.HLC{Wall: wall, Counter: cnt}, nil)
 
-	// Rebuild the materialized view from the durable operation log.
+	// Rebuild the materialized view: prefer a verified checkpoint plus tail
+	// replay; fall back to a full deterministic replay otherwise.
 	world := crdt.NewWorld()
-	ops, err := st.AllOps()
-	if err != nil {
-		st.Close()
-		return nil, fmt.Errorf("replay operations: %w", err)
-	}
-	for _, op := range ops {
-		if _, err := world.Apply(op); err != nil {
-			st.Close()
-			return nil, fmt.Errorf("replay op %s: %w", op.OpID, err)
+	applied := map[string]uint64{}
+	var replayed int
+	replayMode := "full"
+	if cfg.CheckpointEveryOps >= 0 { // checkpoints enabled (0 = close-only)
+		if cd, err := st.LoadCheckpoint(); err == nil && cd.Valid {
+			if w, err := crdt.WorldFromSnapshot(cd.State); err == nil {
+				tail, err := st.AllOpsTail(cd.Covered)
+				if err == nil {
+					ok := true
+					for _, op := range tail {
+						if _, err := w.Apply(op); err != nil {
+							ok = false
+							break
+						}
+					}
+					if ok {
+						world = w
+						for actor, seq := range cd.Covered {
+							applied[actor] = seq
+						}
+						for _, op := range tail {
+							if op.ActorSeq > applied[op.Actor] {
+								applied[op.Actor] = op.ActorSeq
+							}
+						}
+						replayed = len(tail)
+						replayMode = "checkpoint+tail"
+					}
+				}
+			}
 		}
+	}
+	if replayMode == "full" {
+		ops, err := st.AllOps()
+		if err != nil {
+			st.Close()
+			return nil, fmt.Errorf("replay operations: %w", err)
+		}
+		for _, op := range ops {
+			if _, err := world.Apply(op); err != nil {
+				st.Close()
+				return nil, fmt.Errorf("replay op %s: %w", op.OpID, err)
+			}
+			if op.ActorSeq > applied[op.Actor] {
+				applied[op.Actor] = op.ActorSeq
+			}
+		}
+		replayed = len(ops)
 	}
 
 	interval := cfg.SyncIntervalMS
@@ -147,31 +204,92 @@ func Open(cfg Config) (*Node, error) {
 	if cfg.FaultSeed == 0 {
 		cfg.FaultSeed = 1
 	}
+	// One shared HTTP client for all peer sync: keep-alive connection reuse
+	// instead of a new client (and new TCP+TLS-less connections) per pull.
+	httpClient := &http.Client{
+		Timeout: SyncTimeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 8,
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  true, // ops are small JSON; compression costs CPU
+		},
+	}
 	n := &Node{
-		cfg:       cfg,
-		store:     st,
-		clk:       clk,
-		world:     world,
-		faults:    NewFaultController(cfg.FaultSeed),
-		events:    NewEventBus(cfg.ID),
-		kickCh:    make(chan struct{}, 1),
-		stopCh:    make(chan struct{}),
-		startMS:   time.Now().UnixMilli(),
-		peerState: map[string]PeerStatus{},
+		cfg:        cfg,
+		store:      st,
+		clk:        clk,
+		world:      world,
+		faults:     NewFaultController(cfg.FaultSeed),
+		events:     NewEventBus(cfg.ID),
+		httpClient: httpClient,
+		kickCh:     make(chan struct{}, 1),
+		stopCh:     make(chan struct{}),
+		startMS:    time.Now().UnixMilli(),
+		peerState:  map[string]PeerStatus{},
 	}
 	for _, p := range cfg.Peers {
 		n.peerState[p.ID] = PeerStatus{ID: p.ID, URL: p.URL}
 	}
+	n.applied = applied // set before the sync loop starts; no race
+	n.replayMode = replayMode
 	n.wg.Add(1)
 	go n.syncLoop()
-	n.events.Emit("lifecycle", map[string]any{"event": "started", "ops_replayed": len(ops)})
+	n.events.Emit("lifecycle", map[string]any{"event": "started", "ops_replayed": replayed, "replay_mode": replayMode})
 	return n, nil
 }
 
-// Close stops the sync loop and closes storage.
+// appliedSnapshot copies the world-applied watermark. Caller must hold at
+// least a read lock when consistency with world state matters.
+func (n *Node) appliedSnapshot() map[string]uint64 {
+	n.appliedMu.RLock()
+	defer n.appliedMu.RUnlock()
+	out := make(map[string]uint64, len(n.applied))
+	for k, v := range n.applied {
+		out[k] = v
+	}
+	return out
+}
+
+func (n *Node) markApplied(actor string, seq uint64) {
+	n.appliedMu.Lock()
+	if seq > n.applied[actor] {
+		n.applied[actor] = seq
+	}
+	n.appliedMu.Unlock()
+}
+
+// writeCheckpointLocked snapshots the materializer; caller holds n.mu
+// (write). Coverage = the world-applied watermark, read atomically with the
+// world state.
+func (n *Node) writeCheckpointLocked() error {
+	covered := n.appliedSnapshot()
+	state, err := n.world.Snapshot(covered)
+	if err != nil {
+		return err
+	}
+	return n.store.SaveCheckpoint(covered, state)
+}
+
+// writeCheckpoint snapshots the materializer with a read lock.
+func (n *Node) writeCheckpoint() error {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.writeCheckpointLocked()
+}
+
+// WriteCheckpointNow forces a checkpoint (tests and operators).
+func (n *Node) WriteCheckpointNow() error { return n.writeCheckpoint() }
+
+// Close stops the sync loop, writes a materializer checkpoint (so the next
+// start replays only the tail) and closes storage.
 func (n *Node) Close() error {
 	n.stopOnce.Do(func() { close(n.stopCh) })
 	n.wg.Wait()
+	if err := n.writeCheckpoint(); err != nil {
+		// A failed checkpoint is never fatal: the next start full-replays.
+		n.events.Emit("error", map[string]any{"where": "checkpoint", "detail": err.Error()})
+	}
 	return n.store.Close()
 }
 
@@ -220,10 +338,19 @@ func (n *Node) commitLocal(op core.Operation) (core.Operation, error) {
 		n.events.Emit("error", map[string]any{"op_id": op.OpID, "where": "materialize", "detail": err.Error()})
 		return op, fmt.Errorf("materialize local op: %w", err)
 	}
+	n.markApplied(op.Actor, op.ActorSeq)
 	n.events.Emit("op.local", map[string]any{
 		"op_id": op.OpID, "doc_id": op.DocID, "kind": string(op.Kind),
 		"actor": op.Actor, "seq": op.ActorSeq, "hlc_wall": op.HLC.Wall,
 	})
+	if n.cfg.CheckpointEveryOps > 0 {
+		n.ckptCount++
+		if n.ckptCount%n.cfg.CheckpointEveryOps == 0 {
+			if err := n.writeCheckpointLocked(); err != nil {
+				n.events.Emit("error", map[string]any{"where": "checkpoint", "detail": err.Error()})
+			}
+		}
+	}
 	n.kickSync()
 	return op, nil
 }
@@ -351,6 +478,9 @@ func (n *Node) IngestOne(op core.Operation, origin string) store.IngestOutcome {
 	n.clk.Observe(op.HLC)
 	n.mu.Lock()
 	changed, applyErr := n.world.Apply(op)
+	if applyErr == nil {
+		n.markApplied(op.Actor, op.ActorSeq)
+	}
 	n.mu.Unlock()
 	if applyErr != nil {
 		// Extreme-edge deterministic failure (e.g. int64 counter overflow —
@@ -364,8 +494,20 @@ func (n *Node) IngestOne(op core.Operation, origin string) store.IngestOutcome {
 			"actor": op.Actor, "seq": op.ActorSeq, "from": origin,
 		})
 	}
+	if n.cfg.CheckpointEveryOps > 0 {
+		n.ckptCount++
+		if n.ckptCount%n.cfg.CheckpointEveryOps == 0 {
+			if err := n.writeCheckpoint(); err != nil {
+				n.events.Emit("error", map[string]any{"where": "checkpoint", "detail": err.Error()})
+			}
+		}
+	}
 	return outcome
 }
+
+// ReplayMode reports how the materialized view was built at startup:
+// "full" or "checkpoint+tail".
+func (n *Node) ReplayMode() string { return n.replayMode }
 
 // HLC returns the current local HLC (inspection aid).
 func (n *Node) HLC() clock.HLC { return n.clk.Last() }

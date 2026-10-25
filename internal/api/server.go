@@ -28,11 +28,18 @@ type Server struct {
 	webDir   string
 	sseCount atomic.Int64
 	maxSSE   int64
+
+	pullSem chan struct{} // bounds concurrent pull executions (store queries)
 }
+
+// maxConcurrentPulls bounds how many sync-pull requests execute store
+// queries at once; excess requests wait, so a flood of peer pulls cannot
+// monopolize SQLite.
+const maxConcurrentPulls = 8
 
 // NewServer builds the HTTP handler for a node.
 func NewServer(n *node.Node, webDir string) http.Handler {
-	return (&Server{n: n, webDir: webDir, maxSSE: 64}).routes()
+	return (&Server{n: n, webDir: webDir, maxSSE: 64, pullSem: make(chan struct{}, maxConcurrentPulls)}).routes()
 }
 
 func (s *Server) routes() http.Handler {
@@ -177,12 +184,19 @@ func (s *Server) handleCreateDocument(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListDocuments(w http.ResponseWriter, r *http.Request) {
 	includeDeleted := r.URL.Query().Get("include_deleted") == "1"
+	limit := parseIntDefault(r.URL.Query().Get("limit"), 200)
+	if limit > 1000 {
+		limit = 1000 // bound: listing must not clone every document per request
+	}
 	docs := s.n.Documents(includeDeleted)
+	if len(docs) > limit {
+		docs = docs[:limit]
+	}
 	views := make([]map[string]any, 0, len(docs))
 	for _, d := range docs {
 		views = append(views, docViewOf(d))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"documents": views, "node": s.n.ID()})
+	writeJSON(w, http.StatusOK, map[string]any{"documents": views, "node": s.n.ID(), "truncated": len(views) == limit})
 }
 
 func (s *Server) handleGetDocument(w http.ResponseWriter, r *http.Request) {
@@ -279,6 +293,9 @@ func (s *Server) mutationError(w http.ResponseWriter, err error) {
 
 func (s *Server) handleOperations(w http.ResponseWriter, r *http.Request) {
 	limit := parseIntDefault(r.URL.Query().Get("limit"), 100)
+	if limit > 1000 {
+		limit = 1000 // bound: a huge limit must not materialize the whole log
+	}
 	after := r.URL.Query().Get("cursor")
 	ops, err := s.n.Operations(limit, after)
 	if err != nil {
@@ -297,6 +314,12 @@ func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
+	select {
+	case s.pullSem <- struct{}{}:
+		defer func() { <-s.pullSem }()
+	case <-r.Context().Done():
+		return
+	}
 	s.n.ServePull(w, r)
 }
 

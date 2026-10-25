@@ -119,6 +119,9 @@ func cmdServe(args []string) error {
 		Addr:              cfg.HTTPAddr,
 		Handler:           api.NewServer(n, cfg.WebDir),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,  // request bodies; SSE writes unaffected (no WriteTimeout on purpose)
+		IdleTimeout:       120 * time.Second, // keep-alive connections
+		MaxHeaderBytes:    16 << 10,
 	}
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {

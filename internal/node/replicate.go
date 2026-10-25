@@ -223,7 +223,7 @@ func (n *Node) PullFromPeer(p PeerConfig) *SyncSummary {
 	maybeDelay(gate.DelayMS)
 
 	sum := &SyncSummary{Peer: p.ID}
-	client := &http.Client{Timeout: SyncTimeout}
+	client := n.httpClient
 	inv, err := n.Inventory()
 	if err != nil {
 		sum.Note = err.Error()
@@ -358,7 +358,7 @@ func (n *Node) PushToPeer(p PeerConfig, ops []core.Operation) ([]store.IngestOut
 	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{Timeout: SyncTimeout}
+	client := n.httpClient
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(p.URL, "/")+"/api/v1/sync/push", bytes.NewReader(raw))
 	if err != nil {
 		return nil, err

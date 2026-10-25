@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sort"
 
+	"github.com/PrathamKapoor/ConvergeDB/internal/clock"
 	"github.com/PrathamKapoor/ConvergeDB/internal/core"
 )
 
@@ -183,4 +185,96 @@ func (d Document) Clone() Document {
 	}
 	out.Votes = votes
 	return out
+}
+
+// checkpointDoc is the checkpoint serialization of one document accumulator.
+// Field order is fixed; the JSON is deterministic for a given op set.
+type checkpointDoc struct {
+	ID      string           `json:"id"`
+	Created bool             `json:"created"`
+	Title   registerState    `json:"title"`
+	Status  registerState    `json:"status"`
+	Deleted registerState    `json:"deleted"`
+	Labels  orSetState       `json:"labels"`
+	Votes   map[string]int64 `json:"votes"`
+}
+
+type registerState struct {
+	Value string    `json:"value"`
+	H     clock.HLC `json:"hlc"`
+	OpID  string    `json:"op_id"`
+	Set   bool      `json:"set"`
+}
+
+type orSetState struct {
+	Adds  map[string][]string `json:"adds"`
+	Tombs map[string][]string `json:"tombs"`
+}
+
+// CheckpointState is the full serializable materializer state plus the
+// per-actor coverage watermark. The watermark names the dense per-actor
+// operation prefixes the state reflects; rows beyond it are replayed on
+// load. World snapshots are valid only for append-only logs (ConvergeDB's
+// contract) — an operation below the watermark can never appear later.
+type CheckpointState struct {
+	ProtocolVersion int               `json:"protocol_version"`
+	Covered         map[string]uint64 `json:"covered"`
+	Docs            []checkpointDoc   `json:"docs"`
+}
+
+// Snapshot produces the deterministic checkpoint payload for the current
+// accumulator state. The caller supplies the coverage watermark (per-actor
+// dense frontier of the operations this state reflects).
+func (w *World) Snapshot(covered map[string]uint64) ([]byte, error) {
+	docs := w.Documents()
+	out := CheckpointState{
+		ProtocolVersion: core.ProtocolVersion,
+		Covered:         covered,
+		Docs:            make([]checkpointDoc, 0, len(docs)),
+	}
+	for _, d := range docs {
+		out.Docs = append(out.Docs, checkpointDoc{
+			ID:      d.ID,
+			Created: d.Created,
+			Title:   registerState{d.Title.Value, d.Title.H, d.Title.OpID, d.Title.Set()},
+			Status:  registerState{d.Status.Value, d.Status.H, d.Status.OpID, d.Status.Set()},
+			Deleted: registerState{d.Deleted.Value, d.Deleted.H, d.Deleted.OpID, d.Deleted.Set()},
+			Labels:  orSetState{d.Labels.Adds(), d.Labels.Tombs()},
+			Votes:   d.Votes.Entries(),
+		})
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(out); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// WorldFromSnapshot restores a World from a checkpoint payload. It returns
+// an error on any structural mismatch; callers then fall back to full replay.
+func WorldFromSnapshot(data []byte) (*World, error) {
+	var cs CheckpointState
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&cs); err != nil {
+		return nil, fmt.Errorf("checkpoint decode: %w", err)
+	}
+	if cs.ProtocolVersion != core.ProtocolVersion {
+		return nil, fmt.Errorf("checkpoint protocol %d != %d", cs.ProtocolVersion, core.ProtocolVersion)
+	}
+	w := NewWorld()
+	for _, d := range cs.Docs {
+		doc := &Document{
+			ID:      d.ID,
+			Created: d.Created,
+			Title:   NewLWWRegister(d.Title.Value, d.Title.H, d.Title.OpID, d.Title.Set),
+			Status:  NewLWWRegister(d.Status.Value, d.Status.H, d.Status.OpID, d.Status.Set),
+			Deleted: NewLWWRegister(d.Deleted.Value, d.Deleted.H, d.Deleted.OpID, d.Deleted.Set),
+			Labels:  NewORSetFromState(d.Labels.Adds, d.Labels.Tombs),
+			Votes:   NewPNCounterFromEntries(d.Votes),
+		}
+		w.docs[d.ID] = doc
+	}
+	return w, nil
 }

@@ -145,3 +145,111 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Alternatives considered: shipping a token in compose files (normalizes secrets in configs); removing the guard (unsafe).
 - Consequences: docs/SECURITY.md documents the flag; the Docker path itself is NOT TESTED (daemon not running) — recorded in TEST_MATRIX/REPRODUCIBILITY.
 - Files: cmd/convergedb/serve.go, docker-compose.yml
+
+### D-017: Anti-entropy read paths rebuilt: incremental inventory + indexed segment pulls + shared keep-alive client
+- Date / phase / commit: 2026-10-26, Second pass / scale, uncommitted
+- Context: Second-pass scale measurements (tests/adversarial/scale_test.go) showed Inventory() at 6.5ms and MissingOpsFor scanning EVERY row per pull request at 10k ops — per-pull cost grew linearly with log size (O(N) per request, O(peers×N) per interval).
+- Decision: (1) per-actor receive state (frontier/holes/partial) maintained incrementally in memory on every accepted op, rebuilt once at startup; (2) MissingOpsFor computes contiguous candidate segments per actor (requester frontier → local max_seen, minus the requester's advertised holes) and serves each with one indexed range query; (3) one shared keep-alive http.Client for all peer sync. The old scan implementation is retained as MissingOpsForScan, a differential oracle.
+- Why: differential tests (TestIncrementalInventoryMatchesScan, TestMissingOpsIndexedMatchesScan) prove exact equivalence with the scan under randomized arrivals and requester shapes; measured result: inventory and pull cost flat vs log size (0ms/1.0ms at 100k ops).
+- Alternatives considered: summarizing digests per range (adds protocol complexity without removing the decode cost); caching pages (staleness risk).
+- Consequences: the incremental state must remain exactly scan-equivalent — enforced by the differential tests; hole lists beyond the cap are partial by contract.
+- Files: internal/store/store.go, internal/store/ops.go, internal/store/indexed_test.go, internal/node/node.go, internal/node/replicate.go
+
+### D-018: Partial-inventory fallback rescues ops above a stale requester max_seen (correctness fix)
+- Date / phase / commit: 2026-10-26, Second pass / scale, uncommitted
+- Context: The differential harness exposed that the ORIGINAL partial-inventory fallback resent only (frontier, requester.max_seen]. A requester whose max_seen was stale could never learn about newer ops — they were stranded forever, because the requester cannot advertise sequences it has never seen.
+- Decision: the partial fallback (and the indexed path) resends everything above the requester's frontier up to the LOCAL max seen.
+- Why: redundancy is free (idempotent ingest); completeness is not recoverable once skipped. Regression: TestMissingOpsForIsHoleAware partial case now expects [5,6,7] with a stale max_seen of 6.
+- Alternatives considered: trusting requester max_seen (strandable), epoch-based sync (bigger protocol change, unnecessary).
+- Consequences: partial-fallback resends may include more ops than before; still bounded and idempotent.
+- Files: internal/store/ops.go, internal/store/store_test.go
+- Symptom: differential mismatch — indexed delivered an op the scan excluded under a partial inventory with stale max_seen.
+- Root cause: fallback upper bound used the requester's stale max_seen.
+- Regression test: TestMissingOpsForIsHoleAware (partial case), TestMissingOpsIndexedMatchesScan.
+
+### D-019: Inventory Partial flag reflects the ADVERTISED cap, not the internal 512-state cap
+- Date / phase / commit: 2026-10-26, Second pass / scale, uncommitted
+- Context: Differential test showed a requester could receive a truncated hole list WITHOUT the partial flag (internal state cap 512 vs advertised cap parameter), silently breaking the full-range-resend fallback.
+- Decision: Partial = internal partial flag OR true hole count > advertised cap. Additionally, on hole overflow the state keeps the SMALLEST k holes (evict-largest), making the advertised list deterministic and identical to a fresh scan.
+- Why: the hole list must never look complete when it is not; deterministic smallest-k matches the scan oracle exactly (differential test now strict-equal).
+- Alternatives considered: relaxing the differential test when partial (weaker invariant).
+- Consequences: eviction scan is O(cap) per overflow arrival — only under pathological reordering.
+- Files: internal/store/store.go, internal/store/ops.go
+- Symptom: advertised hole lists differed between incremental and scan states.
+- Root cause: two different cap semantics for the same field.
+- Regression test: TestIncrementalInventoryMatchesScan.
+
+### D-020: Verified materializer checkpoints (watermark + tail replay) with fail-closed fallback
+- Date / phase / commit: 2026-10-26, Second pass / scale, uncommitted
+- Context: Startup replay is linear (1.55s at 100k ops, ~15.5s at 1M) — every restart paid it.
+- Decision: migration 3 adds a `checkpoint` table holding the deterministic CRDT accumulator snapshot plus a per-actor coverage watermark (the world-APPLIED max seq, never the store inventory — the two can race). Startup: verify checkpoint hash + per-actor prefix row counts → restore + replay tail (seq > watermark); ANY failure falls back to full replay. Checkpoints are written on graceful close and optionally every CheckpointEveryOps accepted ops. Under-coverage is safe because CRDT merges are idempotent.
+- Why: measured startup at 100k ops: 1.55s → 381ms (4.1x); at 1M ops the gap grows to ~15s vs ~1s. No durability trade-off: the operation log remains the source of truth.
+- Alternatives considered: verifying state digests against a full replay on every load (defeats the purpose); trusting the checkpoint blindly (corruption risk).
+- Consequences: checkpoint content is an optimization, never authoritative; corruption/staleness/prefix mismatch all degrade to the proven full-replay path (tested). New failure mode documented: a checkpoint written by a future protocol version is rejected by version check.
+- Files: internal/store/store.go, internal/store/ops.go, internal/crdt/crdt.go, internal/crdt/world.go, internal/node/node.go, tests/adversarial/checkpoint_test.go
+- Symptom: startup replay time grows linearly with log size.
+- Root cause: full canonical decode + merge of every operation at Open.
+- Regression test: TestCheckpointRestartEquivalence, TestCheckpointTailReplayAfterStaleCheckpoint, TestCheckpointCorruptionFallsBackToFullReplay, TestCheckpointPrefixMismatchFallsBack.
+
+### D-021: HTTP hardening: shared server timeouts, bounded pull concurrency, clamped list endpoints
+- Date / phase / commit: 2026-10-26, Second pass / scale, uncommitted
+- Context: The HTTP server had no Read/Idle timeouts; pull requests could run unbounded concurrently (SQLite pressure); /api/v1/operations?limit was unclamped and /api/v1/documents cloned every document per request.
+- Decision: ReadTimeout 30s + IdleTimeout 120s + 16KiB header cap (NO WriteTimeout — SSE streams are long-lived writes); pull handlers bounded by an 8-slot semaphore; operations limit clamped to 1000; documents list bounded (limit param, default 200, clamp 1000, `truncated` flag).
+- Why: slowloris-style pressure and unbounded serialization are denied by policy; SSE correctness requires the absence of a write deadline (documented inline).
+- Alternatives considered: global WriteTimeout (breaks SSE); per-IP rate limits (out of lab scope, documented).
+- Consequences: long pulls beyond ~30s body-read are cut; SSE unaffected.
+- Files: cmd/convergedb/serve.go, internal/api/server.go
+
+### D-017: Anti-entropy read paths rebuilt: incremental inventory + indexed segment pulls + shared keep-alive client
+- Date / phase / commit: 2026-10-26, Second pass / scale, uncommitted
+- Context: Second-pass scale measurements showed Inventory() at 6.5ms and MissingOpsFor scanning EVERY row per pull request at 10k ops - per-pull cost grew linearly with log size.
+- Decision: (1) per-actor receive state maintained incrementally in memory on every accepted op, rebuilt once at startup; (2) MissingOpsFor computes contiguous candidate segments per actor and serves each with one indexed range query; (3) one shared keep-alive http.Client for all peer sync. The old scan implementation is retained as MissingOpsForScan, a differential oracle.
+- Why: differential tests prove exact equivalence with the scan under randomized arrivals and requester shapes; measured result: inventory and pull cost flat vs log size (0ms/1.0ms at 100k ops).
+- Alternatives considered: range digests (protocol complexity without removing decode cost); page caching (staleness risk).
+- Consequences: incremental state must remain scan-equivalent - enforced by differential tests.
+- Files: internal/store/store.go, internal/store/ops.go, internal/store/indexed_test.go, internal/node/node.go, internal/node/replicate.go
+
+### D-018: Partial-inventory fallback rescues ops above a stale requester max_seen (correctness fix)
+- Date / phase / commit: 2026-10-26, Second pass / scale, uncommitted
+- Context: The differential harness exposed that the ORIGINAL partial fallback resent only (frontier, requester.max_seen]; a requester with a stale max_seen could never learn about newer ops - stranded forever, because it cannot advertise sequences it has never seen.
+- Decision: the partial fallback (and indexed path) resends everything above the requester's frontier up to the LOCAL max seen.
+- Why: redundancy is free (idempotent ingest); completeness is unrecoverable once skipped. Regression: partial case now expects [5,6,7] with a stale max_seen of 6.
+- Alternatives considered: trusting requester max_seen (strandable); epoch-based sync (bigger protocol change).
+- Consequences: partial resends may include more ops; bounded and idempotent.
+- Files: internal/store/ops.go, internal/store/store_test.go
+- Symptom: differential mismatch under partial inventory with stale max_seen.
+- Root cause: fallback upper bound used the stale requester max_seen.
+- Regression test: TestMissingOpsForIsHoleAware, TestMissingOpsIndexedMatchesScan.
+
+### D-019: Inventory Partial flag reflects the ADVERTISED cap; smallest-k holes on overflow
+- Date / phase / commit: 2026-10-26, Second pass / scale, uncommitted
+- Context: A requester could receive a truncated hole list WITHOUT the partial flag (internal state cap 512 vs advertised cap), silently breaking the full-range-resend fallback.
+- Decision: Partial = internal flag OR true hole count > advertised cap; on overflow the state keeps the SMALLEST k holes (evict-largest) so advertised lists are deterministic and scan-identical.
+- Why: a truncated hole list must never look complete; the differential test is strict-equal.
+- Alternatives considered: relaxing the differential test when partial (weaker invariant).
+- Consequences: eviction scan is O(cap) per overflow arrival - pathological reordering only.
+- Files: internal/store/store.go, internal/store/ops.go
+- Symptom: advertised hole lists differed between incremental and scan states.
+- Root cause: two different cap semantics for one field.
+- Regression test: TestIncrementalInventoryMatchesScan.
+
+### D-020: Verified materializer checkpoints (watermark + tail replay) with fail-closed fallback
+- Date / phase / commit: 2026-10-26, Second pass / scale, uncommitted
+- Context: Startup replay is linear (1.55s at 100k ops, ~15.5s at 1M) - every restart paid it.
+- Decision: migration 3 adds a checkpoint table holding the deterministic CRDT accumulator snapshot plus a per-actor coverage watermark (the world-APPLIED max seq, never the store inventory - they can race). Startup: verify checkpoint hash + per-actor prefix row counts, restore, replay tail; ANY failure falls back to full replay. Written on graceful close and every CheckpointEveryOps accepted ops. Under-coverage is safe because CRDT merges are idempotent.
+- Why: measured startup at 100k ops: 1.55s -> 381ms (4.1x). The operation log remains the sole source of truth.
+- Alternatives considered: full-replay verification on every load (defeats the purpose); trusting the checkpoint blindly (corruption risk).
+- Consequences: checkpoint is an optimization, never authoritative; corruption/staleness/prefix mismatch degrade to the proven full-replay path (tested).
+- Files: internal/store/store.go, internal/store/ops.go, internal/crdt/crdt.go, internal/crdt/world.go, internal/node/node.go, tests/adversarial/checkpoint_test.go
+- Symptom: startup replay grows linearly with log size.
+- Root cause: full canonical decode + merge of every operation at Open.
+- Regression test: TestCheckpointRestartEquivalence, TestCheckpointTailReplayAfterStaleCheckpoint, TestCheckpointCorruptionFallsBackToFullReplay, TestCheckpointPrefixMismatchFallsBack.
+
+### D-021: HTTP hardening: shared server timeouts, bounded pull concurrency, clamped list endpoints
+- Date / phase / commit: 2026-10-26, Second pass / scale, uncommitted
+- Context: The HTTP server had no Read/Idle timeouts; pull requests could run unbounded concurrently; operations/documents list endpoints were unbounded.
+- Decision: ReadTimeout 30s + IdleTimeout 120s + 16KiB header cap (NO WriteTimeout - SSE streams are long-lived writes); pull handlers bounded by an 8-slot semaphore; operations limit clamped to 1000; documents list bounded (default 200, clamp 1000, truncated flag).
+- Why: slowloris-style pressure and unbounded serialization denied by policy; SSE correctness requires no write deadline (documented inline).
+- Alternatives considered: global WriteTimeout (breaks SSE); per-IP rate limits (out of lab scope).
+- Consequences: request bodies beyond 30s are cut; SSE unaffected.
+- Files: cmd/convergedb/serve.go, internal/api/server.go

@@ -134,3 +134,69 @@ func (s *ORSet) liveTags(value string) []string {
 }
 
 func sortStrings(s []string) { sort.Strings(s) }
+
+// Adds returns a copy of the add-tag sets (value → sorted tags). Used by the
+// checkpoint snapshot; the map is a deep copy.
+func (s *ORSet) Adds() map[string][]string {
+	out := make(map[string][]string, len(s.adds))
+	for v, tags := range s.adds {
+		l := make([]string, 0, len(tags))
+		for t := range tags {
+			l = append(l, t)
+		}
+		sortStrings(l)
+		out[v] = l
+	}
+	return out
+}
+
+// Tombs returns a copy of the tombstone sets (value → sorted tags).
+func (s *ORSet) Tombs() map[string][]string {
+	out := make(map[string][]string, len(s.tombs))
+	for v, tags := range s.tombs {
+		l := make([]string, 0, len(tags))
+		for t := range tags {
+			l = append(l, t)
+		}
+		sortStrings(l)
+		out[v] = l
+	}
+	return out
+}
+
+// NewORSetFromState restores an OR-Set from checkpointed add/tombstone sets.
+func NewORSetFromState(adds, tombs map[string][]string) *ORSet {
+	s := NewORSet()
+	for v, tags := range adds {
+		if s.adds[v] == nil {
+			s.adds[v] = map[string]struct{}{}
+		}
+		for _, t := range tags {
+			s.adds[v][t] = struct{}{}
+		}
+	}
+	for v, tags := range tombs {
+		for _, t := range tags {
+			if s.tombs[v] == nil {
+				s.tombs[v] = map[string]struct{}{}
+			}
+			s.tombs[v][t] = struct{}{}
+		}
+	}
+	return s
+}
+
+// NewLWWRegister restores a register from checkpointed state.
+func NewLWWRegister(value string, h clock.HLC, opID string, set bool) LWWRegister {
+	return LWWRegister{Value: value, H: h, OpID: opID, set: set}
+}
+
+// NewPNCounterFromEntries restores a counter from checkpointed entries.
+func NewPNCounterFromEntries(entries map[string]int64) *PNCounter {
+	c := NewPNCounter()
+	for opID, delta := range entries {
+		c.entries[opID] = delta
+		c.value += delta
+	}
+	return c
+}
