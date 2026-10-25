@@ -193,6 +193,14 @@ func yesno(b bool) string {
 
 // --- bench ---
 
+type benchResult struct {
+	SchemaVersion int            `json:"schema_version"`
+	Kind          string         `json:"kind"`
+	StartedMS     int64          `json:"started_ms"`
+	Host          string         `json:"host_note"`
+	Profiles      map[string]any `json:"profiles"`
+}
+
 func cmdBench(args []string) error {
 	fs := flag.NewFlagSet("bench", flag.ContinueOnError)
 	writes := fs.Int("writes", 500, "single-node durable writes for the latency profile")
@@ -206,13 +214,6 @@ func cmdBench(args []string) error {
 	}
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		return err
-	}
-	type benchResult struct {
-		SchemaVersion int            `json:"schema_version"`
-		Kind          string         `json:"kind"`
-		StartedMS     int64          `json:"started_ms"`
-		Host          string         `json:"host_note"`
-		Profiles      map[string]any `json:"profiles"`
 	}
 	res := benchResult{SchemaVersion: 1, Kind: "bench", StartedMS: time.Now().UnixMilli(),
 		Host: "local single machine; absolute numbers are environment-specific", Profiles: map[string]any{}}
@@ -258,11 +259,143 @@ func cmdBench(args []string) error {
 			}
 		}()
 	}
+	// Profile 2: three-replica convergence time after partition heal.
+	if err := benchThreeReplica(exe, *outDir, res); err != nil {
+		res.Profiles["three-replica-convergence"] = map[string]any{"error": err.Error()}
+	}
+
 	raw, _ := json.MarshalIndent(res, "", "  ")
 	outPath := filepath.Join(*outDir, "bench-report.json")
 	_ = os.WriteFile(outPath, raw, 0o644)
 	fmt.Println(string(raw))
 	fmt.Println("report:", outPath)
+	return nil
+}
+
+// benchThreeReplica measures heal-to-verified-convergence for a partitioned
+// three-node lab under a fixed isolated-write load. Trials are separate
+// process sets with fresh databases; the reported time covers the last heal
+// to the convergence checker reporting CONVERGED (op inventory + state).
+func benchThreeReplica(exe, outDir string, res benchResult) error {
+	trials := []map[string]any{}
+	for trial := 0; trial < 3; trial++ {
+		dir := filepath.Join(outDir, fmt.Sprintf("trial%d", trial))
+		_ = os.MkdirAll(dir, 0o755)
+		var procs []*replicaProc
+		defer func() {
+			for _, p := range procs {
+				p.Stop()
+			}
+		}()
+		ports := map[string]string{}
+		addrs := map[string]string{}
+		for _, id := range []string{"alpha", "beta", "gamma"} {
+			port, err := freePort()
+			if err != nil {
+				return err
+			}
+			ports[id] = fmt.Sprintf("127.0.0.1:%d", port)
+			addrs[id] = ports[id]
+		}
+		peersFor := func(self string) []string {
+			var out []string
+			for id, a := range addrs {
+				if id != self {
+					out = append(out, id+"=http://"+a)
+				}
+			}
+			return out
+		}
+		for _, id := range []string{"alpha", "beta", "gamma"} {
+			p, err := startReplica(exe, id, filepath.Join(dir, id+".db"), addrs[id], peersFor(id), true, 100)
+			if err != nil {
+				return err
+			}
+			procs = append(procs, p)
+		}
+		for _, a := range addrs {
+			if err := waitReady(a, 20*time.Second); err != nil {
+				return err
+			}
+		}
+		if code, err := apiCall("POST", addrs["alpha"], "/api/v1/documents", map[string]any{"id": "bench", "title": "bench"}, nil); err != nil || code != 201 {
+			return fmt.Errorf("create: %d %v", code, err)
+		}
+		// Isolated writes: alpha cut from both peers, 100 ops per side.
+		for _, pair := range [][2]string{{"alpha", "beta"}, {"alpha", "gamma"}} {
+			if code, err := apiCall("POST", addrs["alpha"], "/api/v1/lab/partition", map[string]string{"a": pair[0], "b": pair[1]}, nil); err != nil || code != 200 {
+				return fmt.Errorf("partition: %d %v", code, err)
+			}
+		}
+		const perSide = 100
+		// Wait until the doc is visible on beta BEFORE isolating, then check
+		// every mutation's status — silent non-200s would corrupt the count.
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			var dv struct {
+				Document map[string]any `json:"document"`
+			}
+			code, err := apiCall("GET", addrs["beta"], "/api/v1/documents/bench", nil, &dv)
+			if err == nil && code == 200 && dv.Document != nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("doc never reached beta before isolation")
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		for i := 0; i < perSide; i++ {
+			if code, err := apiCall("POST", addrs["alpha"], "/api/v1/documents/bench/operations", map[string]any{"action": "vote", "delta": 1}, nil); err != nil || code != 200 {
+				return fmt.Errorf("alpha vote %d: HTTP %d err %v", i, code, err)
+			}
+			if code, err := apiCall("POST", addrs["beta"], "/api/v1/documents/bench/operations", map[string]any{"action": "vote", "delta": 2}, nil); err != nil || code != 200 {
+				return fmt.Errorf("beta vote %d: HTTP %d err %v", i, code, err)
+			}
+		}
+		// Heal and measure.
+		healStart := time.Now()
+		if code, err := apiCall("POST", addrs["alpha"], "/api/v1/lab/heal", map[string]any{}, nil); err != nil || code != 200 {
+			return fmt.Errorf("heal: %d %v", code, err)
+		}
+		rep, ok := waitForConvergence(addrs["alpha"], 60*time.Second)
+		elapsed := time.Since(healStart).Milliseconds()
+		if !ok || rep == nil {
+			return fmt.Errorf("trial %d did not converge", trial)
+		}
+		// Sanity: counter must be exactly perSide*1 + perSide*2.
+		var doc struct {
+			Document struct {
+				Votes int64 `json:"votes"`
+			} `json:"document"`
+		}
+		if code, err := apiCall("GET", addrs["gamma"], "/api/v1/documents/bench", nil, &doc); err != nil || code != 200 {
+			return fmt.Errorf("read back: %d %v", code, err)
+		}
+		if doc.Document.Votes != perSide*3 {
+			return fmt.Errorf("counter wrong after convergence: %d != %d", doc.Document.Votes, perSide*3)
+		}
+		trials = append(trials, map[string]any{
+			"isolated_ops": perSide * 2, "heal_to_converged_ms": elapsed,
+			"votes_check": doc.Document.Votes,
+		})
+		// stop this trial's processes before the next
+		for _, p := range procs {
+			p.Stop()
+		}
+		procs = nil
+	}
+	var times []float64
+	for _, tr := range trials {
+		times = append(times, float64(tr["heal_to_converged_ms"].(int64)))
+	}
+	sort.Float64s(times)
+	res.Profiles["three-replica-convergence"] = map[string]any{
+		"trials":    trials,
+		"median_ms": percentile(times, 50),
+		"min_ms":    times[0],
+		"max_ms":    times[len(times)-1],
+		"note":      "time from heal request to CONVERGED verdict (poll interval 150ms); includes remaining sync rounds",
+	}
 	return nil
 }
 

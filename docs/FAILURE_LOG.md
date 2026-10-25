@@ -46,3 +46,11 @@ Every entry: what failed, exact repro, root cause, fix status. No cosmetic entri
 - Root cause: `IngestOne` asserted `err.(core.ValidationError)` (value) while `ve()` produced `*ValidationError` (pointer), so the type assertion failed and the fallback code was used.
 - Fix: standardized validation errors as VALUE types (`ve()` returns `core.ValidationError`); assertion updated. Tampered ops are now rejected with E_ID by content-addressed validation before the store's E_CONFLICT layer (both paths tested).
 - Regression test: `TestRejectionOfInvalidRemoteOps`, `TestValidateRejectsMalformedOperations`. Status: FIXED.
+
+## 2026-10-26 — benchmark harness silently dropped mutations (counter 286 ≠ 300)
+
+- Symptom: `convergedb bench` three-replica profile's sanity check failed: votes 286, expected 300, though all replicas reported CONVERGED (identical digests).
+- Root cause: the bench harness partitioned alpha↔beta immediately after creating the document on alpha, BEFORE beta had received it; beta's isolated votes then returned 404 (unknown document) and the harness ignored HTTP statuses. 14 votes never existed anywhere — the replicas converged faithfully on what was actually written.
+- Fix: the harness now waits until the document is visible on beta before isolating and asserts every mutation's status code (`cmd/convergedb/tools.go`). 3/3 trials then converge with the counter exactly 300.
+- Regression test: the bench's own assertions (counter == perSide*3). Status: FIXED.
+- Lesson: "converged" means "same operations everywhere", NOT "all intended writes happened" — measurement harnesses must assert their own preconditions.

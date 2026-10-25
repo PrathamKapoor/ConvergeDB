@@ -7,6 +7,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -458,6 +459,12 @@ func fileExists(p string) bool {
 
 func decodeInto(w http.ResponseWriter, r *http.Request, v any) error {
 	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "E_LIMIT",
+				fmt.Sprintf("request body exceeds %d bytes", maxErr.Limit))
+			return err
+		}
 		writeErr(w, http.StatusBadRequest, "E_SCHEMA", "malformed JSON body: "+err.Error())
 		return err
 	}
