@@ -165,3 +165,22 @@ func (w *World) Digest() (string, error) {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:]), nil
 }
+
+// Clone returns a deep copy of the document accumulator, safe to read
+// outside the world's lock while the world keeps merging.
+func (d Document) Clone() Document {
+	out := d
+	labels := NewORSet()
+	for _, v := range d.Labels.Values() {
+		for _, t := range d.Labels.LiveTags(v) {
+			labels.Add(v, t)
+		}
+	}
+	out.Labels = labels
+	votes := NewPNCounter()
+	for opID, delta := range d.Votes.Entries() {
+		_, _ = votes.Apply(opID, delta)
+	}
+	out.Votes = votes
+	return out
+}

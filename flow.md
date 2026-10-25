@@ -6,14 +6,14 @@ Status legend: each flow section is marked PLANNED until the code exists, then k
 
 ## 1. Repository layout (implemented = files exist)
 
-- `cmd/convergedb/` — CLI entrypoint (serve, demo, inspect, verify, bench, doctor) — PLANNED
+- `cmd/convergedb/` — CLI entrypoint (serve, demo, inspect, verify, bench, doctor) — **IMPLEMENTED** (`main.go`, `serve.go`, `demo.go`: seeded partition-heal scenario, `tools.go`, `harness.go`)
 - `internal/clock/` — hybrid logical clock — **IMPLEMENTED** (`hlc.go`: `HLC`, `Compare`, `New`, `Restore`, `Now`, `Observe`)
 - `internal/core/` — typed operations, canonical encoding, checksums, validation — **IMPLEMENTED** (`op.go`: `Operation`, `Canonical`, `Checksum`, `ComputeOpID`, `DeriveAddTag`; `validate.go`: `Validate`, rejection codes)
 - `internal/crdt/` — LWW register, OR-Set, PN/delta counter, document materialization — **IMPLEMENTED** (`crdt.go`: `LWWRegister`, `ORSet`; `counter.go`: `PNCounter`; `world.go`: `World`, `Document`, `CanonicalState`, `Digest`)
 - `internal/store/` — SQLite migrations, durable operation log, actor sequences — **IMPLEMENTED** (`store.go`: `Open`/migrations/`GetMeta`/`SetMeta`; `ops.go`: `AppendLocal`, `IngestRemote`, `Inventory`, `MissingOpsFor`, `AllOps`, `OpDigest`, `ListOps`)
 - `internal/sync/` — inventory, gap detection, pull/push paging, transport faults — PLANNED
-- `internal/node/` — node lifecycle, local writes, remote apply, event bus — PLANNED
-- `internal/api/` — HTTP endpoints, auth, limits, SSE events — PLANNED
+- `internal/node/` — node lifecycle, local writes, remote apply, event bus — **IMPLEMENTED** (`node.go`: `Open`/`CreateDocument`/`Mutate`/`IngestOne`; `replicate.go`: `syncLoop`/`SyncRound`/`PullFromPeer`/`ServePull`/`ServePush`; `faults.go`: `FaultController`; `lab.go`: `Convergence`; `events.go`: `EventBus`)
+- `internal/api/` — HTTP endpoints, auth, limits, SSE events — **IMPLEMENTED** (`server.go`: routes, middleware, lab guards, SSE)
 - `tests/model/` — exhaustive permutation + randomized exchange model tests — **IMPLEMENTED** (`permutation_test.go`)
 - `tests/integration/` — multi-process scenario tests — PLANNED
 - `web/` — React + TypeScript visual workbench — PLANNED
@@ -71,3 +71,15 @@ sync loop per peer (interval + jitter)
 | Inventory | Hole-aware per-actor inventory (frontier + received_above + partial flag) and MissingOpsFor paging with resume cursor | internal/store/ops.go | (this commit) | D-006, D-010 |
 | Bug fix | Pagination cursor skipped the next unsent op at page boundaries; cursor now = last returned op | internal/store/ops.go, docs/FAILURE_LOG.md | (this commit) | D-010 |
 | Dependency | modernc.org/sqlite v1.61.0 added (pure Go) | go.mod, go.sum | (this commit) | D-008 |
+
+## Changes in this session (Phases 03-05: node, API, replication, demo)
+
+| Area | Change | Files | Commit | Decision |
+|---|---|---|---|---|
+| Node | Replica lifecycle, persistent identity, local write path, remote ingest, event bus, fault controller, convergence checker | internal/node/*.go | (this commit) | D-011 |
+| API | Versioned HTTP endpoints incl. sync protocol, lab endpoints, SSE, bearer auth, durable Idempotency-Key | internal/api/server.go, internal/store/store.go | (this commit) | D-011 |
+| CLI | serve/demo/inspect/verify/bench/doctor; seeded 3-replica partition-heal demo writing a JSON report | cmd/convergedb/*.go | (this commit) | D-011 |
+| Demo gate | partition -> isolated writes -> DIVERGED -> heal with duplicate+reorder -> kill/restart beta -> CONVERGED + 6 semantic checks | cmd/convergedb/demo.go, var/reports | (this commit) | D-011 |
+| Bug fix | Lab partition leaked one in-flight exchange; gate re-checked after response | internal/node/replicate.go, docs/FAILURE_LOG.md | (this commit) | D-012 |
+| Bug fix | Node read API aliased live CRDT state (data race); deep snapshots added | internal/crdt/world.go, internal/node/node.go | (this commit) | D-013 |
+| Tests | HTTP-level replication tests: bidirectional sync, partition/heal, duplicate+reorder storms, hole closing, rejections, convergence statuses, identity binding | internal/api/replication_test.go | (this commit) | D-012, D-013 |

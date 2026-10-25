@@ -24,3 +24,25 @@ Every entry: what failed, exact repro, root cause, fix status. No cosmetic entri
 - Root cause: NextCursor encoded the NEXT unsent candidate row, while resume skipped rows `<= cursor` — the candidate itself was skipped on resume and never sent. Classic off-by-one on a snapshot cursor.
 - Fix: cursor now encodes the last RETURNED operation; resume re-examines strictly after it; page ends at the final row produce one empty has_more=false page.
 - Regression test: `TestMissingOpsForIsHoleAware` (internal/store/store_test.go), cursor loop must recover all 7 ops. Status: FIXED, suite green including `-race`.
+
+## 2026-10-26 — lab partition leaked one in-flight exchange (flaky under -race)
+
+- Symptom: `TestPartitionBlocksSyncButNotLocalWrites` failed intermittently (≈1 in 3 runs under `-race`): alpha's store contained beta's isolated write although the alpha→beta link was partitioned.
+- Repro: apply `Faults().Partition()` while a pull request from alpha to beta is in flight; the response (computed after the peer's local write) was ingested despite the partition.
+- Root cause: the fault gate was consulted only BEFORE sending a request. A request already in flight when the partition landed still delivered its response — data crossed the "partition" by milliseconds.
+- Fix: `PullFromPeer` re-checks the gate AFTER each response and discards in-flight responses when the link is now partitioned (`internal/node/replicate.go`). Documented semantics: the transport shim is authoritative for the whole exchange, which real networks cannot be — recorded in the demo report's limitations.
+- Regression test: `TestPartitionBlocksSyncButNotLocalWrites` under `-race -count=8` (previously flaky, now 8/8 green). Status: FIXED.
+
+## 2026-10-26 — data race: Node.Document returned shallow copies aliasing live CRDT state
+
+- Symptom: `go test -race ./internal/api/` — DATA RACE: test goroutine read `PNCounter.Value()` on a document snapshot while the sync loop applied operations.
+- Root cause: `Node.Document`/`Documents` returned `crdt.Document` copies whose `Labels`/`Votes` were POINTERS into the live world; reads outside the node lock raced with merges.
+- Fix: added `Document.Clone()` (deep copy via `ORSet` tag walk + `PNCounter.Entries()`) and made the node return deep snapshots.
+- Regression test: the whole api test package under `-race` (previously failed deterministically on the winning run). Status: FIXED.
+
+## 2026-10-26 — validation error codes collapsed to E_SCHEMA in remote ingest
+
+- Symptom: `TestRejectionOfInvalidRemoteOps` — a tampered op (same ID, different body) was rejected with the generic E_SCHEMA instead of its real code.
+- Root cause: `IngestOne` asserted `err.(core.ValidationError)` (value) while `ve()` produced `*ValidationError` (pointer), so the type assertion failed and the fallback code was used.
+- Fix: standardized validation errors as VALUE types (`ve()` returns `core.ValidationError`); assertion updated. Tampered ops are now rejected with E_ID by content-addressed validation before the store's E_CONFLICT layer (both paths tested).
+- Regression test: `TestRejectionOfInvalidRemoteOps`, `TestValidateRejectsMalformedOperations`. Status: FIXED.

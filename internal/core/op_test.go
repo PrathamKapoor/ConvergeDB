@@ -145,7 +145,7 @@ func TestValidateRejectsMalformedOperations(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected rejection")
 			}
-			if ve, ok := err.(*ValidationError); !ok || ve.Code != tc.wantC {
+			if ve, ok := err.(ValidationError); !ok || ve.Code != tc.wantC {
 				t.Fatalf("got %v (%T), want code %s", err, err, tc.wantC)
 			}
 		})

@@ -16,8 +16,8 @@ type ValidationError struct {
 
 func (e ValidationError) Error() string { return fmt.Sprintf("%s: %s", e.Code, e.Detail) }
 
-func ve(code, format string, args ...any) *ValidationError {
-	return &ValidationError{Code: code, Detail: fmt.Sprintf(format, args...)}
+func ve(code, format string, args ...any) ValidationError {
+	return ValidationError{Code: code, Detail: fmt.Sprintf(format, args...)}
 }
 
 // Rejection codes.
@@ -200,6 +200,19 @@ func Validate(op Operation) error {
 	}
 	if wantID != op.OpID {
 		return ve(CodeID, "op_id does not match operation content (content-addressed id required)")
+	}
+	return nil
+}
+
+// CheckCreatePayload validates the document-ID and initial-title parts of a
+// create request before an operation exists (the API layer uses this to
+// return clean 400s; the op itself is validated again before commit).
+func CheckCreatePayload(docID, title string) error {
+	if !docIDRe.MatchString(docID) {
+		return ve(CodeID, "doc_id %q must match %s", docID, docIDRe)
+	}
+	if utf8.RuneCountInString(title) > MaxTitleRunes {
+		return ve(CodeLimit, "initial title exceeds %d runes", MaxTitleRunes)
 	}
 	return nil
 }

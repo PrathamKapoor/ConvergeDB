@@ -40,6 +40,11 @@ func (s *Store) AppendLocal(op *core.Operation, issued clock.HLC) error {
 	}
 	op.ActorSeq = next
 	op.ProtocolVersion = core.ProtocolVersion
+	if op.Kind == core.KindLabelAdd {
+		// The add-tag derives from (actor, actor_seq), which only the store
+		// knows; set it here so the op ID covers the finalized body.
+		op.Payload.Tag = core.DeriveAddTag(op.Actor, op.ActorSeq)
+	}
 	id, err := core.ComputeOpID(*op)
 	if err != nil {
 		return fmt.Errorf("derive op id: %w", err)
@@ -463,3 +468,30 @@ func (s *Store) ListOps(limit int, afterOpID string) ([]core.Operation, error) {
 	}
 	return ops, rows.Err()
 }
+
+// IdempotencyGet returns the stored op ID and response body for a replayed
+// mutation key.
+func (s *Store) IdempotencyGet(key string) (opID, response string, ok bool, err error) {
+	err = s.db.QueryRow(`SELECT op_id, response FROM idempotency WHERE key = ?`, key).Scan(&opID, &response)
+	if err == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return opID, response, true, nil
+}
+
+// IdempotencyPut records a mutation response under its key, capping the
+// table at maxIdempotencyRows by evicting the oldest entries.
+func (s *Store) IdempotencyPut(key, opID, response string) error {
+	if _, err := s.db.Exec(`INSERT INTO idempotency (key, op_id, response, created_ms) VALUES (?, ?, ?, ?)
+		ON CONFLICT(key) DO NOTHING`, key, opID, response, time.Now().UnixMilli()); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM idempotency WHERE key IN (
+		SELECT key FROM idempotency ORDER BY created_ms DESC LIMIT -1 OFFSET ?)`, maxIdempotencyRows)
+	return err
+}
+
+const maxIdempotencyRows = 10000

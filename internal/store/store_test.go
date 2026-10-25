@@ -214,6 +214,8 @@ func asConflict(err error, target **ConflictError) bool {
 	return false
 }
 
+var _ = asConflict
+
 func TestInventoryTracksFrontierAndHoles(t *testing.T) {
 	st, _ := openTemp(t)
 	ingest := func(actor string, seq uint64, wall int64, val string) {

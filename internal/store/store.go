@@ -89,6 +89,20 @@ var migrations = []struct {
 				ON operations (doc_id)`,
 		},
 	},
+	{
+		version: 2,
+		stmts: []string{
+			// Idempotency keys for local API mutations: a retried POST with
+			// the same key replays the original response instead of creating
+			// a second operation.
+			`CREATE TABLE IF NOT EXISTS idempotency (
+				key        TEXT PRIMARY KEY,
+				op_id      TEXT    NOT NULL,
+				response   TEXT    NOT NULL,
+				created_ms INTEGER NOT NULL
+			)`,
+		},
+	},
 }
 
 func migrate(db *sql.DB) error {

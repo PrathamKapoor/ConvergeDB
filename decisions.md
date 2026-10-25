@@ -103,3 +103,36 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Symptom: `TestMissingOpsForIsHoleAware` — cursor pagination returned [1 2 3 5 6 7]; op 4 vanished.
 - Root cause: cursor pointed at the first unsent candidate; resume skipped `<= cursor`.
 - Regression test: TestMissingOpsForIsHoleAware (cursor loop must recover all 7 ops).
+
+### D-011: Node layer + HTTP API + CLI structure
+- Date / phase / commit: 2026-10-26, Phases 03-04, uncommitted
+- Context: The durable store and CRDTs need a runnable replica, a versioned HTTP surface, and a CLI.
+- Decision: `internal/node` owns lifecycle (persistent replica identity bound to the DB file, HLC restore, replay-rebuild, write path, ingest, sync loop, fault controller, event bus, convergence checker). `internal/api` is a thin versioned HTTP layer over it (health, node, documents, operations, sync, lab, SSE). `cmd/convergedb` has serve/demo/inspect/verify/bench/doctor using only the standard library flag package. Lab endpoints 403 without `--lab`; non-loopback binds refuse to start without `--token`.
+- Why: keeps merge semantics free of I/O; the API maps 1:1 onto protocol operations; fault injection lives in the node's sync client so EVERY allowed exchange is real HTTP between real processes.
+- Alternatives considered: gRPC sync (heavier, less inspectable); third-party router (stdlib ServeMux patterns suffice); YAML configs (JSON keeps stdlib-only).
+- Consequences: sync is pull-driven per peer with opportunistic push available; partitions gate both directions of a link from either endpoint's API.
+- Files: internal/node/*.go, internal/api/*.go, cmd/convergedb/*.go
+
+### D-012: Lab partitions are transport-shim authoritative (in-flight responses discarded)
+- Date / phase / commit: 2026-10-26, Phase 04, uncommitted
+- Context: A partition applied while a pull request was in flight let the response through, leaking one exchange across the "partition" (caught by a flaky -race test).
+- Decision: `PullFromPeer` re-checks the fault gate after each response and discards in-flight responses when the link is now partitioned.
+- Why: makes lab partitions deterministic and reproducible. Honest caveat (recorded in demo reports): a real network cannot recall in-flight packets; the shim simulates the network, it is not a firewall.
+- Alternatives considered: leaving the real-network behavior and relaxing the test (rejected: deterministic lab semantics are the point of the shim).
+- Consequences: PROTOCOL/DEMO docs must state this shim behavior.
+- Files: internal/node/replicate.go
+- Symptom: flaky partition isolation under -race.
+- Root cause: gate checked only before send.
+- Regression test: TestPartitionBlocksSyncButNotLocalWrites under -race -count=8.
+
+### D-013: Node read API returns deep-copy snapshots
+- Date / phase / commit: 2026-10-26, Phase 04, uncommitted
+- Context: `Node.Document` returned shallow copies whose CRDT pointers aliased live merge state — a real data race under concurrent replication.
+- Decision: `crdt.Document.Clone()` deep-copies labels (tag walk) and counter (entries map); node read paths return clones.
+- Why: snapshots must be safe to read while the node keeps replicating; -race is part of the test gate.
+- Alternatives considered: forcing all readers through node locks (leaks locking into callers).
+- Consequences: snapshot reads are O(doc size) — fine at this scale, measured in benchmarks.
+- Files: internal/crdt/counter.go, internal/crdt/world.go, internal/node/node.go
+- Symptom: DATA RACE on PNCounter.Value under -race.
+- Root cause: shallow copy aliasing.
+- Regression test: internal/api suite under -race.

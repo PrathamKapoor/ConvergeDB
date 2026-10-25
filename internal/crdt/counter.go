@@ -56,3 +56,12 @@ func (c *PNCounter) Value() int64 { return c.value }
 
 // Len returns the number of contributing operations (test/inspection aid).
 func (c *PNCounter) Len() int { return len(c.entries) }
+
+// Entries returns a copy of the contributing (opID -> delta) map.
+func (c *PNCounter) Entries() map[string]int64 {
+	out := make(map[string]int64, len(c.entries))
+	for k, v := range c.entries {
+		out[k] = v
+	}
+	return out
+}
