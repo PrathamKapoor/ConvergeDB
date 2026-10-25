@@ -7,14 +7,14 @@ Status legend: each flow section is marked PLANNED until the code exists, then k
 ## 1. Repository layout (implemented = files exist)
 
 - `cmd/convergedb/` — CLI entrypoint (serve, demo, inspect, verify, bench, doctor) — PLANNED
-- `internal/clock/` — hybrid logical clock — PLANNED
-- `internal/core/` — typed operations, canonical encoding, checksums, validation — PLANNED
-- `internal/crdt/` — LWW register, OR-Set, PN/delta counter, document materialization — PLANNED
+- `internal/clock/` — hybrid logical clock — **IMPLEMENTED** (`hlc.go`: `HLC`, `Compare`, `New`, `Restore`, `Now`, `Observe`)
+- `internal/core/` — typed operations, canonical encoding, checksums, validation — **IMPLEMENTED** (`op.go`: `Operation`, `Canonical`, `Checksum`, `ComputeOpID`, `DeriveAddTag`; `validate.go`: `Validate`, rejection codes)
+- `internal/crdt/` — LWW register, OR-Set, PN/delta counter, document materialization — **IMPLEMENTED** (`crdt.go`: `LWWRegister`, `ORSet`; `counter.go`: `PNCounter`; `world.go`: `World`, `Document`, `CanonicalState`, `Digest`)
 - `internal/store/` — SQLite migrations, durable operation log, actor sequences — PLANNED
 - `internal/sync/` — inventory, gap detection, pull/push paging, transport faults — PLANNED
 - `internal/node/` — node lifecycle, local writes, remote apply, event bus — PLANNED
 - `internal/api/` — HTTP endpoints, auth, limits, SSE events — PLANNED
-- `tests/model/` — permutation/property tests — PLANNED
+- `tests/model/` — exhaustive permutation + randomized exchange model tests — **IMPLEMENTED** (`permutation_test.go`)
 - `tests/integration/` — multi-process scenario tests — PLANNED
 - `web/` — React + TypeScript visual workbench — PLANNED
 
@@ -48,5 +48,16 @@ sync loop per peer (interval + jitter)
 
 | Area | Change | Files | Commit | Decision |
 |---|---|---|---|---|
-| Project bootstrap | Created root ledgers, scope doc, license, .gitignore | decisions.md, flow.md, handoff.md, docs/SCOPE.md, LICENSE, .gitignore | (this commit) | D-001, D-003 |
-| Toolchain | Portable Go 1.27.3 installed at C:\Users\LENOVO\tools\go (outside repo, no global changes) | none | (this commit) | D-002 |
+| Project bootstrap | Created root ledgers, scope doc, license, .gitignore | decisions.md, flow.md, handoff.md, docs/SCOPE.md, LICENSE, .gitignore | 0f94404 | D-001, D-003 |
+| Toolchain | Portable Go 1.27.3 installed at C:\Users\LENOVO\tools\go (outside repo, no global changes) | none | 0f94404 | D-002 |
+
+## Changes in this session (Phase 01)
+
+| Area | Change | Files | Commit | Decision |
+|---|---|---|---|---|
+| HLC | Hybrid logical clock: total order (wall, counter, actor), rollback-safe, persisted-restore, observe watermark | internal/clock/hlc.go, internal/clock/hlc_test.go | (this commit) | D-007 |
+| Core operations | Typed op envelope, canonical JSON, content-addressed op ID, checksum, add-tag derivation, fail-closed validation with stable codes | internal/core/op.go, internal/core/validate.go, internal/core/op_test.go | (this commit) | D-006, D-007 |
+| CRDTs | LWW register (max-merge + deterministic tie-break), OR-Set with tombstones, delta counter with dedup + overflow fail-closed | internal/crdt/crdt.go, internal/crdt/counter.go | (this commit) | D-005 |
+| Materialization | World: op stream -> documents -> canonical JSON state + SHA-256 digest; create-arrives-last buffered | internal/crdt/world.go | (this commit) | D-005 |
+| Model tests | Exhaustive 7!-permutation convergence, duplicate-laden schedules, two-replica exchange model | tests/model/permutation_test.go | (this commit) | D-005 |
+| Bug fix | OR-Set eager deletion was order-dependent; rebuilt with tombstones | internal/crdt/crdt.go, docs/FAILURE_LOG.md | (this commit) | D-005 |

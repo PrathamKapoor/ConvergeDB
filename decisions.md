@@ -37,3 +37,33 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Alternatives considered: unknown until Phase 02 verification runs.
 - Consequences: none yet.
 - Files: none yet
+
+### D-005: OR-Set uses persistent tombstones (fix for order-dependent divergence)
+- Date / phase / commit: 2026-10-26, Phase 01, uncommitted
+- Context: The first OR-Set implementation deleted observed tags eagerly. Exhaustive permutation tests diverged: a remove arriving before the add it observed did nothing, and the later add resurrected the value — state depended on arrival order (I-02/I-03 violated).
+- Decision: Rebuild OR-Set as `adds` + `tombstones` maps (`internal/crdt/crdt.go`); live = adds minus tombstones. A remove tombstones exactly the tags it names. Tombstones are never garbage-collected.
+- Why: Commutative union of tombstones makes merge order irrelevant; the mission requires "retain required tombstones" and forbids unverified GC. Tests: exhaustive 7!-permutation suite plus duplicate-laden schedules now pass deterministically.
+- Alternatives considered: eager deletion (failed, see docs/FAILURE_LOG.md); full state-based OR-Set serialization for sync (not needed: operations carry observed tag sets directly).
+- Consequences: Storage grows with removed tags — an honest, documented cost until causal-stability GC is proven safe (mission §7 forbids it now).
+- Files: internal/crdt/crdt.go, internal/crdt/crdt_test.go, docs/FAILURE_LOG.md
+- Symptom: `TestWorldPermutationInvariance` divergence at permutation 121; digests differed across apply orders.
+- Root cause: eager tag deletion is not a commutative merge; remove-before-add lost the remove's intent.
+- Regression test: `TestORSetObservedRemoveSemantics`, `TestORSetAddWinsAcrossAnyApplyOrder`, `tests/model` exhaustive permutations.
+
+### D-006: Add-tag derives from (actor, actor_seq), not from the op ID
+- Date / phase / commit: 2026-10-26, Phase 01, uncommitted
+- Context: Content-addressed op IDs (SHA-256 over canonical content) plus "tag == op ID" for label.add are mutually circular: the tag would have to contain its own hash.
+- Decision: `core.DeriveAddTag(actor, actorSeq)` = hex SHA-256 of `"convergedb:add-tag:" + actor + ":" + seq`. Validation requires label.add payloads to carry exactly this tag.
+- Why: (actor, actor_seq) is unique per operation, so the tag is unique; derivation is deterministic, so seeded demos and property tests reproduce identical histories; the tag is covered by the op ID content hash, tying it to the add operation.
+- Alternatives considered: random 128-bit tags (breaks reproducibility of seeded tests); tag == op ID (circular, unimplementable).
+- Consequences: PROTOCOL.md must specify this derivation; changing the derivation string would invalidate stored tags, so it is frozen for protocol v1.
+- Files: internal/core/op.go, internal/core/validate.go, internal/crdt/crdt_test.go, tests/model/permutation_test.go
+
+### D-007: Canonical encoding = fixed-order struct JSON, no HTML escaping; op ID = SHA-256 of canonical bytes with OpID blanked; checksum = SHA-256 of full canonical bytes
+- Date / phase / commit: 2026-10-26, Phase 01, uncommitted
+- Context: Convergence requires byte-equality of canonical state and tamper-evident operation identity; the wire needs one deterministic encoding.
+- Decision: Canonical form is the Go struct's declared field order, encoded with `encoding/json` and `SetEscapeHTML(false)` (internal/core/op.go). `ComputeOpID` = SHA-256 over canonical bytes with OpID blanked (content-addressed identity). `Checksum` = SHA-256 over canonical bytes including OpID (integrity only, NOT a signature).
+- Why: Struct order is stable across platforms for a fixed Go struct; round-trip stability is tested (`TestCanonicalEncodingIsDeterministicAndStable`); validation fails closed when op_id ≠ derived ID, making accidental ID reuse with a different body impossible for validated ops.
+- Alternatives considered: protobuf/ CBOR canonicalization (extra dependency, no gain at this scale); random UUID op IDs (weaker: IDs wouldn't detect payload mismatches at validation time).
+- Consequences: Struct field order in Operation/Payload/HLC is frozen for protocol v1; changing it breaks every stored checksum and requires a protocol version bump.
+- Files: internal/core/op.go, internal/core/op_test.go
