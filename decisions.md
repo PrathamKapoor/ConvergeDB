@@ -39,7 +39,7 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Files: none yet
 
 ### D-005: OR-Set uses persistent tombstones (fix for order-dependent divergence)
-- Date / phase / commit: 2026-10-26, Phase 01, uncommitted
+- Date / phase / commit: 2026-10-26, Phase 01, 35b740a
 - Context: The first OR-Set implementation deleted observed tags eagerly. Exhaustive permutation tests diverged: a remove arriving before the add it observed did nothing, and the later add resurrected the value — state depended on arrival order (I-02/I-03 violated).
 - Decision: Rebuild OR-Set as `adds` + `tombstones` maps (`internal/crdt/crdt.go`); live = adds minus tombstones. A remove tombstones exactly the tags it names. Tombstones are never garbage-collected.
 - Why: Commutative union of tombstones makes merge order irrelevant; the mission requires "retain required tombstones" and forbids unverified GC. Tests: exhaustive 7!-permutation suite plus duplicate-laden schedules now pass deterministically.
@@ -51,7 +51,7 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Regression test: `TestORSetObservedRemoveSemantics`, `TestORSetAddWinsAcrossAnyApplyOrder`, `tests/model` exhaustive permutations.
 
 ### D-006: Add-tag derives from (actor, actor_seq), not from the op ID
-- Date / phase / commit: 2026-10-26, Phase 01, uncommitted
+- Date / phase / commit: 2026-10-26, Phase 01, 35b740a
 - Context: Content-addressed op IDs (SHA-256 over canonical content) plus "tag == op ID" for label.add are mutually circular: the tag would have to contain its own hash.
 - Decision: `core.DeriveAddTag(actor, actorSeq)` = hex SHA-256 of `"convergedb:add-tag:" + actor + ":" + seq`. Validation requires label.add payloads to carry exactly this tag.
 - Why: (actor, actor_seq) is unique per operation, so the tag is unique; derivation is deterministic, so seeded demos and property tests reproduce identical histories; the tag is covered by the op ID content hash, tying it to the add operation.
@@ -60,7 +60,7 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Files: internal/core/op.go, internal/core/validate.go, internal/crdt/crdt_test.go, tests/model/permutation_test.go
 
 ### D-007: Canonical encoding = fixed-order struct JSON, no HTML escaping; op ID = SHA-256 of canonical bytes with OpID blanked; checksum = SHA-256 of full canonical bytes
-- Date / phase / commit: 2026-10-26, Phase 01, uncommitted
+- Date / phase / commit: 2026-10-26, Phase 01, 35b740a
 - Context: Convergence requires byte-equality of canonical state and tamper-evident operation identity; the wire needs one deterministic encoding.
 - Decision: Canonical form is the Go struct's declared field order, encoded with `encoding/json` and `SetEscapeHTML(false)` (internal/core/op.go). `ComputeOpID` = SHA-256 over canonical bytes with OpID blanked (content-addressed identity). `Checksum` = SHA-256 over canonical bytes including OpID (integrity only, NOT a signature).
 - Why: Struct order is stable across platforms for a fixed Go struct; round-trip stability is tested (`TestCanonicalEncodingIsDeterministicAndStable`); validation fails closed when op_id ≠ derived ID, making accidental ID reuse with a different body impossible for validated ops.
@@ -69,7 +69,7 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Files: internal/core/op.go, internal/core/op_test.go
 
 ### D-008: SQLite driver = modernc.org/sqlite v1.61.0 (pure Go, no CGO)
-- Date / phase / commit: 2026-10-26, Phase 02, uncommitted
+- Date / phase / commit: 2026-10-26, Phase 02, f815e59
 - Context: Persistence requires SQLite with WAL; the host is Windows with no confirmed C toolchain, so a CGO driver may not build.
 - Decision: Use `modernc.org/sqlite` v1.61.0 as the database/sql driver (registered name "sqlite").
 - Why: Installed and verified by the full store test suite (`go test ./internal/store/` passes, including `-race`): migrations, WAL (journal_mode set via DSN pragmas), busy_timeout, synchronous=FULL, unique (actor, actor_seq), idempotent ingest. Pure Go — builds with the portable toolchain without gcc.
@@ -81,7 +81,7 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Files: go.mod, go.sum, internal/store/store.go, internal/store/ops.go, internal/store/store_test.go
 
 ### D-009: Local op identity is finalized inside AppendLocal (seq first, then op ID)
-- Date / phase / commit: 2026-10-26, Phase 02, uncommitted
+- Date / phase / commit: 2026-10-26, Phase 02, f815e59
 - Context: Op IDs are content-addressed over the canonical body, and the body includes actor_seq — which only the store assigns in its transaction. Computing the ID before allocation would bind the ID to a body the op never had.
 - Decision: `Store.AppendLocal` (internal/store/ops.go) assigns actor_seq, derives the op ID, validates fail-closed, then inserts — all in one transaction that also persists the HLC watermark. Caller-supplied OpID/ActorSeq are overwritten.
 - Why: Guarantees a stored op always satisfies op_id == hash(body), keeping I-04 detection meaningful and post-restart validation exact.
@@ -93,7 +93,7 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Regression test: TestAppendLocalAllocatesDenseSequencesAndSurvivesRestart (re-derives and verifies on reload).
 
 ### D-010: Sync pagination cursor = last returned op, resume strictly after it
-- Date / phase / commit: 2026-10-26, Phase 02, uncommitted
+- Date / phase / commit: 2026-10-26, Phase 02, f815e59
 - Context: MissingOpsFor pages results; the first cursor design pointed at the NEXT unsent candidate, and the resume filter skipped `seq <= cursor`, so that candidate was never delivered (test caught op 4 silently lost).
 - Decision: NextCursor encodes the last RETURNED operation; resume re-examines everything strictly after it. A page that ends exactly at the final row yields one empty follow-up page with has_more=false.
 - Why: "Resume after what you actually received" cannot skip rows; simplicity beats saving one empty round-trip.
@@ -105,7 +105,7 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Regression test: TestMissingOpsForIsHoleAware (cursor loop must recover all 7 ops).
 
 ### D-011: Node layer + HTTP API + CLI structure
-- Date / phase / commit: 2026-10-26, Phases 03-04, uncommitted
+- Date / phase / commit: 2026-10-26, Phases 03-04, bbd2c72
 - Context: The durable store and CRDTs need a runnable replica, a versioned HTTP surface, and a CLI.
 - Decision: `internal/node` owns lifecycle (persistent replica identity bound to the DB file, HLC restore, replay-rebuild, write path, ingest, sync loop, fault controller, event bus, convergence checker). `internal/api` is a thin versioned HTTP layer over it (health, node, documents, operations, sync, lab, SSE). `cmd/convergedb` has serve/demo/inspect/verify/bench/doctor using only the standard library flag package. Lab endpoints 403 without `--lab`; non-loopback binds refuse to start without `--token`.
 - Why: keeps merge semantics free of I/O; the API maps 1:1 onto protocol operations; fault injection lives in the node's sync client so EVERY allowed exchange is real HTTP between real processes.
@@ -114,7 +114,7 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Files: internal/node/*.go, internal/api/*.go, cmd/convergedb/*.go
 
 ### D-012: Lab partitions are transport-shim authoritative (in-flight responses discarded)
-- Date / phase / commit: 2026-10-26, Phase 04, uncommitted
+- Date / phase / commit: 2026-10-26, Phase 04, bbd2c72
 - Context: A partition applied while a pull request was in flight let the response through, leaking one exchange across the "partition" (caught by a flaky -race test).
 - Decision: `PullFromPeer` re-checks the fault gate after each response and discards in-flight responses when the link is now partitioned.
 - Why: makes lab partitions deterministic and reproducible. Honest caveat (recorded in demo reports): a real network cannot recall in-flight packets; the shim simulates the network, it is not a firewall.
@@ -126,7 +126,7 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Regression test: TestPartitionBlocksSyncButNotLocalWrites under -race -count=8.
 
 ### D-013: Node read API returns deep-copy snapshots
-- Date / phase / commit: 2026-10-26, Phase 04, uncommitted
+- Date / phase / commit: 2026-10-26, Phase 04, bbd2c72
 - Context: `Node.Document` returned shallow copies whose CRDT pointers aliased live merge state — a real data race under concurrent replication.
 - Decision: `crdt.Document.Clone()` deep-copies labels (tag walk) and counter (entries map); node read paths return clones.
 - Why: snapshots must be safe to read while the node keeps replicating; -race is part of the test gate.
@@ -136,3 +136,12 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Symptom: DATA RACE on PNCounter.Value under -race.
 - Root cause: shallow copy aliasing.
 - Regression test: internal/api suite under -race.
+
+### D-016: Containerized deployments opt out of the loopback guard via --allow-unsafe-bind
+- Date / phase / commit: 2026-10-26, Phase 09, c393ab8
+- Context: docker-compose replicas must bind 0.0.0.0 inside containers, but serve refuses non-loopback binds without a token (safety baseline).
+- Decision: new `--allow-unsafe-bind` flag used ONLY in docker-compose.yml; the guard remains default-on for bare processes.
+- Why: the guard prevents accidental public exposure of a bare host process; inside a container the bind is internal and port publishing is the operator's explicit act.
+- Alternatives considered: shipping a token in compose files (normalizes secrets in configs); removing the guard (unsafe).
+- Consequences: docs/SECURITY.md documents the flag; the Docker path itself is NOT TESTED (daemon not running) — recorded in TEST_MATRIX/REPRODUCIBILITY.
+- Files: cmd/convergedb/serve.go, docker-compose.yml

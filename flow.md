@@ -76,10 +76,20 @@ sync loop per peer (interval + jitter)
 
 | Area | Change | Files | Commit | Decision |
 |---|---|---|---|---|
-| Node | Replica lifecycle, persistent identity, local write path, remote ingest, event bus, fault controller, convergence checker | internal/node/*.go | (this commit) | D-011 |
-| API | Versioned HTTP endpoints incl. sync protocol, lab endpoints, SSE, bearer auth, durable Idempotency-Key | internal/api/server.go, internal/store/store.go | (this commit) | D-011 |
-| CLI | serve/demo/inspect/verify/bench/doctor; seeded 3-replica partition-heal demo writing a JSON report | cmd/convergedb/*.go | (this commit) | D-011 |
-| Demo gate | partition -> isolated writes -> DIVERGED -> heal with duplicate+reorder -> kill/restart beta -> CONVERGED + 6 semantic checks | cmd/convergedb/demo.go, var/reports | (this commit) | D-011 |
-| Bug fix | Lab partition leaked one in-flight exchange; gate re-checked after response | internal/node/replicate.go, docs/FAILURE_LOG.md | (this commit) | D-012 |
-| Bug fix | Node read API aliased live CRDT state (data race); deep snapshots added | internal/crdt/world.go, internal/node/node.go | (this commit) | D-013 |
-| Tests | HTTP-level replication tests: bidirectional sync, partition/heal, duplicate+reorder storms, hole closing, rejections, convergence statuses, identity binding | internal/api/replication_test.go | (this commit) | D-012, D-013 |
+| Node | Replica lifecycle, persistent identity, local write path, remote ingest, event bus, fault controller, convergence checker | internal/node/*.go | bbd2c72 | D-011 |
+| API | Versioned HTTP endpoints incl. sync protocol, lab endpoints, SSE, bearer auth, durable Idempotency-Key | internal/api/server.go, internal/store/store.go | bbd2c72 | D-011 |
+| CLI | serve/demo/inspect/verify/bench/doctor; seeded 3-replica partition-heal demo writing a JSON report | cmd/convergedb/*.go | bbd2c72 | D-011 |
+| Demo gate | partition -> isolated writes -> DIVERGED -> heal with duplicate+reorder -> kill/restart beta -> CONVERGED + 6 semantic checks | cmd/convergedb/demo.go, var/reports | bbd2c72 | D-011 |
+| Bug fix | Lab partition leaked one in-flight exchange; gate re-checked after response | internal/node/replicate.go, docs/FAILURE_LOG.md | bbd2c72 | D-012 |
+| Bug fix | Node read API aliased live CRDT state (data race); deep snapshots added | internal/crdt/world.go, internal/node/node.go | bbd2c72 | D-013 |
+| Tests | HTTP-level replication tests: bidirectional sync, partition/heal, duplicate+reorder storms, hole closing, rejections, convergence statuses, identity binding | internal/api/replication_test.go | bbd2c72 | D-012, D-013 |
+
+## Changes in this session (Phases 07-10: hardening, benchmarks, docs, release)
+
+| Area | Change | Files | Commit | Decision |
+|---|---|---|---|---|
+| Hardening | Level D suite: auth, lab gating, malformed input, 413/409/405/404, durable idempotency replay | internal/api/hardening_test.go, internal/api/server.go | b38c60f | D-011 |
+| Benchmarks | three-replica heal→converged profile with exact counter assertion; bench harness precondition fix | cmd/convergedb/tools.go, docs/RESULTS.md | b38c60f | D-011 |
+| Web | Cache-Control no-store + stale-view banner | internal/api/server.go, web/src | 3e5d2af | D-015 |
+| Docs | README/PROTOCOL/CONSISTENCY/ARCHITECTURE/SECURITY/TEST_MATRIX/REPRODUCIBILITY/DEMO/COMPARISON, CI, Docker files, examples | docs/*, .github/workflows/ci.yml, Dockerfile, docker-compose.yml | c393ab8 | D-016 |
+| Release | Repo created on GitHub and pushed; HEAD verified on remote | (remote) | c393ab8 (pushed) | — |
