@@ -84,6 +84,9 @@ func Validate(op Operation) error {
 	if op.HLC.Wall <= 0 || op.HLC.Counter < 0 {
 		return ve(CodeClock, "hlc wall_ms must be > 0 and counter >= 0")
 	}
+	if op.HLC.Actor != op.Actor {
+		return ve(CodeClock, "hlc.actor %q must equal the operation actor %q (timestamps are issued by their author)", op.HLC.Actor, op.Actor)
+	}
 	if !actorRe.MatchString(op.HLC.Actor) {
 		return ve(CodeClock, "hlc.actor %q must match %s", op.HLC.Actor, actorRe)
 	}

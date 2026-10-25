@@ -67,3 +67,39 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Alternatives considered: protobuf/ CBOR canonicalization (extra dependency, no gain at this scale); random UUID op IDs (weaker: IDs wouldn't detect payload mismatches at validation time).
 - Consequences: Struct field order in Operation/Payload/HLC is frozen for protocol v1; changing it breaks every stored checksum and requires a protocol version bump.
 - Files: internal/core/op.go, internal/core/op_test.go
+
+### D-008: SQLite driver = modernc.org/sqlite v1.61.0 (pure Go, no CGO)
+- Date / phase / commit: 2026-10-26, Phase 02, uncommitted
+- Context: Persistence requires SQLite with WAL; the host is Windows with no confirmed C toolchain, so a CGO driver may not build.
+- Decision: Use `modernc.org/sqlite` v1.61.0 as the database/sql driver (registered name "sqlite").
+- Why: Installed and verified by the full store test suite (`go test ./internal/store/` passes, including `-race`): migrations, WAL (journal_mode set via DSN pragmas), busy_timeout, synchronous=FULL, unique (actor, actor_seq), idempotent ingest. Pure Go — builds with the portable toolchain without gcc.
+- Alternatives considered: mattn/go-sqlite3 (rejected: requires CGO + gcc on Windows); ncruces/go-sqlite3 (WASM-based; not chosen — larger runtime surface, no observed need). Supersedes: D-004 (the placeholder).
+- Consequences: go.mod/go.sum carry the modernc dependency tree; the driver is slower than CGO sqlite — acceptable for this project's scale and measured later in benchmarks.
+- Package: modernc.org/sqlite v1.61.0
+- Why this package: pure-Go SQLite with database/sql compatibility, WAL support, no CGO toolchain requirement.
+- Packages compared: mattn/go-sqlite3 (CGO build risk on this host), ncruces/go-sqlite3 (WASM overhead).
+- Files: go.mod, go.sum, internal/store/store.go, internal/store/ops.go, internal/store/store_test.go
+
+### D-009: Local op identity is finalized inside AppendLocal (seq first, then op ID)
+- Date / phase / commit: 2026-10-26, Phase 02, uncommitted
+- Context: Op IDs are content-addressed over the canonical body, and the body includes actor_seq — which only the store assigns in its transaction. Computing the ID before allocation would bind the ID to a body the op never had.
+- Decision: `Store.AppendLocal` (internal/store/ops.go) assigns actor_seq, derives the op ID, validates fail-closed, then inserts — all in one transaction that also persists the HLC watermark. Caller-supplied OpID/ActorSeq are overwritten.
+- Why: Guarantees a stored op always satisfies op_id == hash(body), keeping I-04 detection meaningful and post-restart validation exact.
+- Alternatives considered: client-supplied sequence numbers (rejected: central-free uniqueness is the store's job).
+- Consequences: Node layer never fabricates identities; remote ops (which arrive already identified) use IngestRemote instead.
+- Files: internal/store/ops.go, internal/core/validate.go
+- Symptom: discovered in review — stored ops would fail re-validation after restart (ID bound to seq=0 body).
+- Root cause: content-addressed ID computed before sequence allocation.
+- Regression test: TestAppendLocalAllocatesDenseSequencesAndSurvivesRestart (re-derives and verifies on reload).
+
+### D-010: Sync pagination cursor = last returned op, resume strictly after it
+- Date / phase / commit: 2026-10-26, Phase 02, uncommitted
+- Context: MissingOpsFor pages results; the first cursor design pointed at the NEXT unsent candidate, and the resume filter skipped `seq <= cursor`, so that candidate was never delivered (test caught op 4 silently lost).
+- Decision: NextCursor encodes the last RETURNED operation; resume re-examines everything strictly after it. A page that ends exactly at the final row yields one empty follow-up page with has_more=false.
+- Why: "Resume after what you actually received" cannot skip rows; simplicity beats saving one empty round-trip.
+- Alternatives considered: cursor = next candidate with `seq < cursor` filter (equally correct but easier to reason wrong about under concurrent appends).
+- Consequences: Documented in PROTOCOL.md; bounded redundancy on skip-heavy ranges.
+- Files: internal/store/ops.go, internal/store/store_test.go
+- Symptom: `TestMissingOpsForIsHoleAware` — cursor pagination returned [1 2 3 5 6 7]; op 4 vanished.
+- Root cause: cursor pointed at the first unsent candidate; resume skipped `<= cursor`.
+- Regression test: TestMissingOpsForIsHoleAware (cursor loop must recover all 7 ops).

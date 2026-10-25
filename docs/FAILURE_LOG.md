@@ -16,3 +16,11 @@ Every entry: what failed, exact repro, root cause, fix status. No cosmetic entri
 - Root cause: two reasonable constraints (content-addressed operation IDs; add-tag tied to the add operation's identity) were combined in a circular way.
 - Fix: add-tags are derived from the add operation's identity inputs instead: `core.DeriveAddTag(actor, actorSeq) = hex(sha256("convergedb:add-tag:" actor ":" seq))`. Unique because (actor, actor_seq) is unique; deterministic so seeded histories reproduce; covered by the op ID content hash. Validation enforces the derivation (fail closed).
 - Regression test: any label.add construction in the test suites; `TestValidateRejectsMalformedOperations/label tag mismatch`. Status: FIXED.
+
+## 2026-10-26 — sync pagination cursor silently dropped one operation per page boundary
+
+- Symptom: `TestMissingOpsForIsHoleAware` — paging through 7 operations with page size 3 returned [1 2 3 5 6 7]; seq 4 disappeared exactly at the page boundary.
+- Repro: `store.MissingOpsFor(nil, 3, ...)` looping via NextCursor (internal/store/ops.go).
+- Root cause: NextCursor encoded the NEXT unsent candidate row, while resume skipped rows `<= cursor` — the candidate itself was skipped on resume and never sent. Classic off-by-one on a snapshot cursor.
+- Fix: cursor now encodes the last RETURNED operation; resume re-examines strictly after it; page ends at the final row produce one empty has_more=false page.
+- Regression test: `TestMissingOpsForIsHoleAware` (internal/store/store_test.go), cursor loop must recover all 7 ops. Status: FIXED, suite green including `-race`.
