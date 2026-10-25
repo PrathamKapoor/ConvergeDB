@@ -253,3 +253,15 @@ Format per rule: `### D-NNN:` entries appended at the end. Never edit or delete 
 - Alternatives considered: global WriteTimeout (breaks SSE); per-IP rate limits (out of lab scope).
 - Consequences: request bodies beyond 30s are cut; SSE unaffected.
 - Files: cmd/convergedb/serve.go, internal/api/server.go
+
+### D-022: Demo CLI flags honored; scenario refuses reused scratch directories
+- Date / phase / commit: 2026-10-26, Second pass / operations, uncommitted
+- Context: The second-pass demo gate failed with votes=6 instead of 3. Investigation: (1) cmdDemo parsed flags AFTER a positional subcommand token, so flag.Parse stopped immediately and --seed/--keep/--out/--dir were silently ignored in every demo invocation; (2) re-running on the same --dir accumulated state, and the check's absolute expectation (votes == 3) saw two runs' worth of votes - a false double-counting alarm.
+- Decision: skip the leading subcommand token before flag parsing; the demo fails fast (clear message, nonzero exit) when the target directory already contains replica databases, and NEVER deletes them.
+- Why: the scenario asserts absolute values by design; silently reusing state produces misleading results, and auto-deleting operator data is forbidden. The counter itself was verified correct via differential and kill-mid-burst suites.
+- Alternatives considered: auto-cleaning the directory (destroys evidence/data); relative assertions (weaker checks).
+- Consequences: repeated demo runs need a fresh --dir (documented in DEMO.md); flags now behave as documented.
+- Files: cmd/convergedb/demo.go
+- Symptom: demo semantic check failed with exactly doubled votes on repeated runs.
+- Root cause: ignored flags + state accumulation across runs, not a merge defect.
+- Regression test: dirty-dir rejection verified manually; fresh-dir demo green (seed 123).

@@ -93,3 +93,18 @@ sync loop per peer (interval + jitter)
 | Web | Cache-Control no-store + stale-view banner | internal/api/server.go, web/src | 3e5d2af | D-015 |
 | Docs | README/PROTOCOL/CONSISTENCY/ARCHITECTURE/SECURITY/TEST_MATRIX/REPRODUCIBILITY/DEMO/COMPARISON, CI, Docker files, examples | docs/*, .github/workflows/ci.yml, Dockerfile, docker-compose.yml | c393ab8 | D-016 |
 | Release | Repo created on GitHub and pushed; HEAD verified on remote | (remote) | c393ab8 (pushed) | — |
+
+## Changes in this session (Second pass: audit, scale, correctness)
+
+| Area | Change | Files | Commit | Decision |
+|---|---|---|---|---|
+| Audit | System inventory + claim-to-evidence map | docs/audit/SYSTEM_INVENTORY.md, docs/audit/CLAIM_TO_EVIDENCE.md | 7eea73b | - |
+| Scale fix | Incremental inventory + indexed segment pulls + shared HTTP client (old scan kept as oracle) | internal/store/*, internal/node/* | 7eea73b | D-017 |
+| Correctness fix | Partial-inventory fallback rescues ops above a stale requester max_seen | internal/store/ops.go | 7eea73b | D-018 |
+| Correctness fix | Partial flag reflects advertised cap; smallest-k holes on overflow | internal/store/store.go | 7eea73b | D-019 |
+| Scale feature | Verified materializer checkpoints (watermark + tail replay, fail-closed fallback) | internal/store, internal/crdt, internal/node, tests/adversarial/checkpoint_test.go | 7eea73b | D-020 |
+| Hardening | Server timeouts, pull semaphore, clamped endpoints | cmd/convergedb/serve.go, internal/api/server.go | 7eea73b | D-021 |
+| Fault lab | 10-node asymmetric partitions, offline rejoin, restart-order scenarios, subprocess kill-mid-burst | tests/adversarial/multinode_test.go, subprocess_test.go | (this commit) | - |
+| Operations | Backup via VACUUM INTO + round-trip test; OPERATIONS.md runbook | internal/store/ops.go, cmd/convergedb/admin.go, docs/OPERATIONS.md | (this commit) | - |
+| Demo fix | Flag parsing honored; fail-fast on reused scratch dir | cmd/convergedb/demo.go | (this commit) | D-022 |
+| Findings | P0 none; P1 x4 fixed; P2 x7 (5 fixed, 2 open: GC contract, Docker untested) | docs/audit/FINDINGS.md | (this commit) | - |

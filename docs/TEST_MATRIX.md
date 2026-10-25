@@ -69,3 +69,23 @@ go test -race ./...    # concurrency gate (green, 8/8 repeated runs on the flake
 - Playwright browser automation and mobile-width screenshots — not installed in the environment; Level E was executed interactively instead (above).
 - Docker Compose lab build — compose file and Dockerfile are provided, but the image build was NOT TESTED: the Docker CLI (29.8.1) is installed while the Docker Desktop daemon was not running on the development host. First `docker compose up --build` on a running daemon may surface image-version issues (golang:1.27-alpine, node:22-alpine).
 - Formal verification — none claimed.
+
+## Second-pass additions (2026-10-26, tests/adversarial/ — written against the external protocol)
+
+| Test | What it proves |
+|---|---|
+| TestScaleReplicationReadPaths (10k/100k tiers via SCALE_OPS) | measured: inventory/pull flat vs log size after the indexed rewrite; startup replay vs checkpoint comparison |
+| TestIncrementalInventoryMatchesScan | incremental inventory state strictly equals a fresh full-scan under 800+ randomized out-of-order arrivals |
+| TestMissingOpsIndexedMatchesScan | indexed pull path strictly equals the scan oracle across 7 requester shapes × 4 page sizes + cursor drains |
+| TestIndexedPullIsBoundedByPageAndHoles | pull cost does not grow with log size when the requester needs nothing |
+| TestCheckpointRestartEquivalence | checkpoint restart: byte-identical state + inventory; seq continues (create+200 → next 202) |
+| TestCheckpointTailReplayAfterStaleCheckpoint | stale watermark → tail replay → identical state |
+| TestCheckpointCorruptionFallsBackToFullReplay | corrupt checkpoint → full replay → identical state |
+| TestCheckpointPrefixMismatchFallsBack | forged coverage → rejected → full replay |
+| TestTenNodeAsymmetricPartitions | 10 nodes, two islands + sub-split + delayed peer, staged randomized heal: CONVERGED, votes exactly 29, all digests equal (8/8 race runs) |
+| TestOfflineNodeRejoinsAfterManyOps | 150 ops accumulate offline; rejoin catches up with exact inventory/state equality |
+| TestRestartEveryNodeInDifferentOrders | stop all, restart in two orders on reused DBs: identical durable inventories and state |
+| TestKillMidBurstPreservesAcknowledgedWrites | real subprocess SIGKILL mid-burst: every ACKed op survives; seq continues (5 runs, varied seeds) |
+| TestBackupRestoreRoundTrip | VACUUM INTO backup of an OPEN WAL store: point-in-time semantics, identity restored, seq continues |
+
+Second-pass totals: 60 Go tests green (`go test ./...`), race-clean on all scenario suites.

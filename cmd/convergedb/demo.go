@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -45,6 +46,12 @@ type demoReport struct {
 }
 
 func cmdDemo(args []string) error {
+	// The dispatcher passes the subcommand name ("partition-heal") as the
+	// first argument; flag parsing must skip it or every flag is silently
+	// ignored (found by the second-pass audit).
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		args = args[1:]
+	}
 	fs := flag.NewFlagSet("demo partition-heal", flag.ContinueOnError)
 	out := fs.String("out", "var/reports/partition-heal-report.json", "report output path")
 	seed := fs.Int64("seed", 42, "fault seed (reproducible fault decisions)")
@@ -56,6 +63,16 @@ func cmdDemo(args []string) error {
 	}
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
 		return err
+	}
+	// The scenario asserts ABSOLUTE values (e.g. votes == 3), so it requires
+	// a fresh scratch directory. Refuse to run on existing replica databases
+	// instead of silently accumulating state from earlier runs (this exact
+	// trap produced a false counter-double-counting alarm during the second
+	// pass) — and never delete operator data automatically.
+	for _, id := range []string{"alpha", "beta", "gamma"} {
+		if _, err := os.Stat(filepath.Join(*dir, id+".db")); err == nil {
+			return fmt.Errorf("demo requires a fresh --dir: %s already contains %s.db from an earlier run (the scenario asserts absolute state values); choose a new --dir or remove the old databases yourself", *dir, id)
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(*out), 0o755); err != nil {
 		return err

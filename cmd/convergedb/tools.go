@@ -10,8 +10,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
+
+// syncWaitGroup is a tiny alias to keep the concurrency profile readable.
+type syncWaitGroup = sync.WaitGroup
 
 // --- inspect ---
 
@@ -204,6 +208,8 @@ type benchResult struct {
 func cmdBench(args []string) error {
 	fs := flag.NewFlagSet("bench", flag.ContinueOnError)
 	writes := fs.Int("writes", 500, "single-node durable writes for the latency profile")
+	clients := fs.Int("clients", 0, "concurrent writer clients (0 = skip the concurrency profile)")
+	docs := fs.Int("docs", 0, "document count for the many-documents profile (0 = skip)")
 	outDir := fs.String("out", "var/bench", "output directory")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -259,6 +265,111 @@ func cmdBench(args []string) error {
 			}
 		}()
 	}
+	// Profile 1b: concurrent writers on one node.
+	if *clients > 0 {
+		if port, err := freePort(); err == nil {
+			addr := fmt.Sprintf("127.0.0.1:%d", port)
+			p, err := startReplica(exe, "benchc", filepath.Join(*outDir, "benchc.db"), addr, nil, false, 1000)
+			if err != nil {
+				return err
+			}
+			func() {
+				defer p.Stop()
+				if err := waitReady(addr, 20*time.Second); err != nil {
+					res.Profiles["concurrent-writes"] = map[string]any{"error": err.Error()}
+					return
+				}
+				if code, err := apiCall("POST", addr, "/api/v1/documents", map[string]any{"id": "conc", "title": "conc"}, nil); err != nil || code != 201 {
+					res.Profiles["concurrent-writes"] = map[string]any{"error": fmt.Sprintf("create: HTTP %d %v", code, err)}
+					return
+				}
+				total := *writes
+				perClient := total / *clients
+				lat := make([][]float64, *clients)
+				start := time.Now()
+				var wg syncWaitGroup
+				for c := 0; c < *clients; c++ {
+					wg.Add(1)
+					go func(c int) {
+						defer wg.Done()
+						for i := 0; i < perClient; i++ {
+							t0 := time.Now()
+							code, err := apiCall("POST", addr, "/api/v1/documents/conc/operations", map[string]any{
+								"action": "vote", "delta": 1,
+							}, nil)
+							d := float64(time.Since(t0).Microseconds()) / 1000.0
+							lat[c] = append(lat[c], d)
+							if err != nil || code != 200 {
+								continue // counted via error rate below
+							}
+						}
+					}(c)
+				}
+				wg.Wait()
+				elapsed := time.Since(start)
+				var all []float64
+				for _, l := range lat {
+					all = append(all, l...)
+				}
+				sort.Float64s(all)
+				done := len(all)
+				res.Profiles["concurrent-writes"] = map[string]any{
+					"clients": *clients, "writes_attempted": total, "writes_ok": done,
+					"p50_ms": percentile(all, 50), "p95_ms": percentile(all, 95), "p99_ms": percentile(all, 99),
+					"throughput_ops_per_s": float64(done) / elapsed.Seconds(),
+				}
+			}()
+		}
+	}
+
+	// Profile 1c: many documents (bounded list reads + digest cost).
+	if *docs > 0 {
+		if port, err := freePort(); err == nil {
+			addr := fmt.Sprintf("127.0.0.1:%d", port)
+			p, err := startReplica(exe, "benchd", filepath.Join(*outDir, "benchd.db"), addr, nil, false, 1000)
+			if err != nil {
+				return err
+			}
+			func() {
+				defer p.Stop()
+				if err := waitReady(addr, 20*time.Second); err != nil {
+					res.Profiles["many-documents"] = map[string]any{"error": err.Error()}
+					return
+				}
+				start := time.Now()
+				for i := 0; i < *docs; i++ {
+					if code, err := apiCall("POST", addr, "/api/v1/documents", map[string]any{
+						"id": fmt.Sprintf("doc-%06d", i), "title": fmt.Sprintf("Document %d", i),
+					}, nil); err != nil || code != 201 {
+						res.Profiles["many-documents"] = map[string]any{"error": fmt.Sprintf("create %d: HTTP %d %v", i, code, err)}
+						return
+					}
+				}
+				createDur := time.Since(start)
+				var listOut struct {
+					Truncated bool `json:"truncated"`
+				}
+				start = time.Now()
+				if code, err := apiCall("GET", addr, "/api/v1/documents?limit=200", nil, &listOut); err != nil || code != 200 {
+					res.Profiles["many-documents"] = map[string]any{"error": fmt.Sprintf("list: HTTP %d %v", code, err)}
+					return
+				}
+				listDur := time.Since(start)
+				start = time.Now()
+				var conv map[string]any
+				if code, err := apiCall("GET", addr, "/api/v1/lab/convergence", nil, &conv); err != nil || code != 200 {
+					res.Profiles["many-documents"] = map[string]any{"error": fmt.Sprintf("convergence: HTTP %d %v", code, err)}
+					return
+				}
+				digestDur := time.Since(start)
+				res.Profiles["many-documents"] = map[string]any{
+					"documents": *docs, "create_seconds": createDur.Seconds(),
+					"list_200_ms": listDur.Milliseconds(), "convergence_digest_ms": digestDur.Milliseconds(),
+				}
+			}()
+		}
+	}
+
 	// Profile 2: three-replica convergence time after partition heal.
 	if err := benchThreeReplica(exe, *outDir, res); err != nil {
 		res.Profiles["three-replica-convergence"] = map[string]any{"error": err.Error()}

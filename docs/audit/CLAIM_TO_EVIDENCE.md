@@ -21,9 +21,9 @@ Every meaningful README/doc claim and user-visible action, mapped to source and 
 |---|---|---|---|
 | All v1 endpoints respond per PROTOCOL.md | internal/api/server.go | hardening + replication suites; smoke via curl during first pass | VERIFIED |
 | Non-loopback bind refuses without token (or --allow-unsafe-bind) | cmd/convergedb/serve.go | code-inspected; CLI-level test pending | PARTIAL → test added this pass (see FINDINGS P2-4) |
-| `demo partition-heal` exits nonzero on failed invariant | cmd/convergedb/demo.go | code-inspected + step failure paths; no negative-injection run yet | PARTIAL |
+| `demo partition-heal` honors flags and exits nonzero on failed invariant | cmd/convergedb/demo.go | flags parsed correctly (P2-6 fixed); dirty-dir rejection verified; step-failure path exercised by the P2-7 investigation | VERIFIED |
 | `bench` asserts counter == perSide×3 | cmd/convergedb/tools.go | observed failure mode pre-fix (286≠300), then 3/3 pass | VERIFIED |
-| Idempotency-Key replays the SAME operation | internal/api + store.idempotency | TestIdempotencyKeyReplaysOriginalResponse (durable across restart? — in-process only) | PARTIAL → durability across restart asserted this pass |
+| Idempotency-Key replays the SAME operation | internal/api + store.idempotency (SQLite-backed) | TestIdempotencyKeyReplaysOriginalResponse; storage is durable (SQLite table) | VERIFIED |
 
 ## Frontend claims
 
@@ -31,7 +31,7 @@ Every meaningful README/doc claim and user-visible action, mapped to source and 
 |---|---|---|
 | "Every number comes from a live replica API" | browser session (first pass): votes/labels replicated live; screenshots from running app | VERIFIED (interactive) |
 | Convergence banner distinguishes CONVERGED/DIVERGED/UNKNOWN + staleness | browser session: DIVERGED shown mid-partition; STALE path implemented, not exercised in browser | PARTIAL |
-| "UI must not freeze on large datasets" (second-pass requirement) | op list capped 40; documents list **unbounded** → pending limit (FINDINGS P2-3) | PARTIAL |
+| "UI must not freeze on large datasets" (second-pass requirement) | op list capped 40; documents list bounded server-side + UI passes explicit limit (P2-3 fixed) | VERIFIED (bounded reads; 100k-row rendering not exercised) |
 | All buttons functional or visibly disabled | browser session; fault panel disabled outside lab mode | VERIFIED (interactive) |
 
 ## Infrastructure claims

@@ -1,53 +1,54 @@
 # handoff.md — current state for the next session
 
 ## 1. Current Phase
-- Phase: 10 — Release (COMPLETE). All mission phases 00–10 executed.
-- Subphase: repository published and verified on GitHub.
-- Objective: none open; see "Unfinished Work" for honest gaps.
+- Phase: Second pass — scalability, correctness, and total system audit (COMPLETE)
+- Subphase: audit docs, measured scale fixes, fault laboratory, operations runbook shipped
+- Objective: none open; remaining stretch items listed in section 9
 - Status: complete
 
 ## 2. Work Completed
-- Full ConvergeDB implementation: HLC, typed operations with content-addressed IDs, LWW/OR-Set/delta-counter CRDTs, durable SQLite store (WAL+FULL, in-tx sequence allocation, checksum-verified reads), replica node with anti-entropy sync (hole-aware inventories, cursor paging, fault shim), versioned HTTP API, CLI (serve/demo/inspect/verify/bench/doctor), seeded 3-process partition-heal demo with JSON report, React+TS web laboratory, 48 tests (race-clean), hardening suite, real benchmarks, complete docs, CI workflow.
-- Published to https://github.com/PrathamKapoor/ConvergeDB (public, MIT). Push VERIFIED: local HEAD = origin/main = GitHub HEAD = c393ab8c52f3de1345f45884f40ba51b97e9d2eb at first push; final docs commit pushed on top.
-- Fresh-clone verified: temp-dir clone builds, passes all tests, runs the demo (seed 99) and doctor successfully.
+- Full second-pass audit: docs/audit/SYSTEM_INVENTORY.md (every component, route, table accounted for), docs/audit/CLAIM_TO_EVIDENCE.md (claims mapped to executed evidence), docs/audit/FINDINGS.md (P0: none; P1 ×4 fixed; P2 ×7: 5 fixed, 2 open and documented).
+- Measured scale fixes: anti-entropy pull/inventory were O(N) per request — rebuilt as incremental inventory + indexed segment queries + shared keep-alive client (differential tests prove exact scan-equivalence). Measured: inventory/pull flat vs log size (0ms/1.0ms at 100k ops; previously ~65ms+ projected per call at 100k).
+- CORRECTNESS FIX (found by the new differential harness): the partial-inventory fallback could strand ops above a stale requester max_seen forever; now resends up to LOCAL max_seen. Partial flag also reflects the advertised cap; smallest-k holes kept on overflow.
+- Verified materializer checkpoints: per-actor world-applied watermark + tail replay, hash + prefix-count verification, fail-closed full-replay fallback. Startup at 100k ops: 1.55s → 381ms (4.1×).
+- Fault laboratory: 10-node asymmetric-partition scenario with staged randomized heals (digest equality across all nodes, exact vote totals), offline-rejoin catch-up (150 ops), restart-all-nodes in two orders, REAL subprocess SIGKILL mid-burst (every ACKed op survived, 5 seeds).
+- Operations: `convergedb admin backup` (VACUUM INTO, point-in-time, identity-preserving) with round-trip test; docs/OPERATIONS.md runbook incl. troubleshooting.
+- Benchmarks: docs/BENCHMARKS.md with BEFORE/AFTER tables and workload matrix (concurrency tiers, 2000-doc tier, 3-replica convergence 188–340ms with exact 300=300 counter).
+- Demo hardening: fixed silent CLI flag ignorance (flags were never parsed in any prior demo run!) and fail-fast on reused scratch dirs (a false counter-double-counting alarm was traced to state accumulation, not a merge defect).
 
 ## 3. Files Changed
-See `git log --oneline` (8 commits, 0f94404 → final) and flow.md "Changes in this session" tables per phase. Root ledgers (decisions.md, flow.md, handoff.md) and docs/ are part of the repository.
+- internal/store (store.go, ops.go, indexed_test.go, store_test.go), internal/crdt (crdt.go, world.go), internal/node (node.go, replicate.go), internal/api (server.go), cmd/convergedb (serve.go, demo.go, admin.go, tools.go, main.go), tests/adversarial/ (scale, checkpoint, multinode, subprocess, backup), web/src/api.ts, docs/* (audit trio, BENCHMARKS, SCALABILITY, OPERATIONS, TEST_MATRIX, README), decisions.md, flow.md, handoff.md.
 
 ## 4. Current Architecture / State
-- Module layout and call graphs: docs/ARCHITECTURE.md (accurate to the code).
-- Wire contract: docs/PROTOCOL.md (protocol v1, frozen canonical encodings).
-- Web workbench builds to web/dist and is served by `convergedb serve --web`.
+- Unchanged boundaries (docs/ARCHITECTURE.md) plus: checkpoint table (schema v3), incremental in-memory inventory, world-applied watermark for checkpoint coverage, MissingOpsForScan oracle retained for differential testing.
 
 ## 5. Decisions Made
-- D-001..D-016 in decisions.md, each with context/alternatives/consequences. Highlights: portable user-local Go (D-002), modernc.org/sqlite v1.61.0 (D-008), add-tag derivation (D-006), OR-Set tombstones (D-005), transport-shim-authoritative partitions (D-012), deep-copy snapshots (D-013), no-store + staleness banner (D-015), --allow-unsafe-bind for containers (D-016).
+- D-017..D-022 (see decisions.md): indexed anti-entropy, partial-fallback correctness, partial-flag semantics, verified checkpoints, HTTP hardening, demo flag/dir fixes.
 
 ## 6. Requirements and Constraints
-- Commits only as PrathamKapoor (global git identity verified); no attribution lines; never commit paper/, research/, .tex, runtime DBs, or secrets. All satisfied in the pushed history.
+- Unchanged from the first pass: commit author identity, no attribution lines, no paper/research/.tex, no runtime DBs or secrets in git, non-destructive publishing.
 
 ## 7. Testing and Verification
-- `go test ./...` — 48 tests, all PASS (latest run in fresh clone, 2026-10-26).
-- `go test -race ./internal/... ./tests/...` — PASS (including 8/8 repeated runs of the previously flaky partition suite).
-- `./convergedb demo partition-heal --seed 42` and `--seed 99` — PASS, exit 0, JSON reports written.
-- `./convergedb bench --writes 300` — p50 ~1.6 ms / p95 ~2.4 ms, 3-replica heal→CONVERGED ~308 ms median, counter check 300=300 (docs/RESULTS.md).
-- Browser session (in-app Chromium): live replication, UI-driven partition → DIVERGED → heal → CONVERGED, LWW winner on all panels; screenshots captured from the running app.
-- NOT tested: Docker image build (daemon not running), Playwright automation suite, power-loss durability, public-internet deployment. All recorded in docs/TEST_MATRIX.md.
+- `go test ./...` — 60 tests green; `go test -race ./internal/... ./tests/...` — 7 packages green (scenario suites run repeatedly; the 10-node scenario 8/8 after fixing a test-sentinel flake).
+- `convergedb demo partition-heal` (seed 123) — PASS with 6/6 semantic checks on a fresh dir; dirty-dir rerun rejected with an actionable error.
+- Scale: 10k and 100k-op tiers measured (tests/adversarial/scale_test.go; SCALE_OPS env). NOT run: 25 replicas, 1M ops, 50/100 concurrent clients, multi-host.
+- NOT TESTED: Docker image build (daemon unavailable), Playwright UI automation, power-loss durability, GC (unimplemented by design).
 
 ## 8. Known Issues / Risks
-- Confirmed: Docker path untested (daemon down); Level E automation absent (manual browser session only); tombstone/log growth unbounded by design.
-- Possible: CI workflow (.github/workflows/ci.yml) has not run yet on GitHub — first push triggered it; check the Actions tab.
-- The UI convergence banner once showed a stale view during testing; unreproducible in 3 attempts, mitigated with no-store + staleness indicator (D-015).
+- Open P2s (documented, deliberate): unbounded log/tombstone growth (safe GC needs a membership/retention contract that does not exist yet — design sketch in docs/SCALABILITY.md); Docker path untested.
+- The demo requires a fresh --dir per run (fail-fast); CI uses a fresh checkout so it is unaffected.
 
 ## 9. Unfinished Work
-- Stretch items from the mission (Phase 10 stretch): selective peer subscription, snapshot bootstrap, witness minimization, richer trace export, cross-machine deployment guide.
-- Optional: Playwright suite; Docker verification; GitHub Pages for docs.
+- Snapshot-bootstrap endpoint for fresh replicas (page-streamed catch-up works today; measured acceptable at 100k).
+- Epoch-based retention/GC protocol (design sketch only).
+- Playwright UI suite; Docker verification; 25-replica and 1M-op tiers on bigger hardware.
 
 ## 10. Next Subphase
-- None required. If resuming: check the first CI run on GitHub Actions and fix any environment-specific failures there (workflow expects Go 1.27.x + Node 22 on ubuntu-latest).
+- If resuming: take the GC/membership design to a proof-of-safety document, then implement behind a protocol version bump; or add the snapshot-bootstrap endpoint using the existing checkpoint format.
 
 ## 11. Critical Context
-- Portable Go lives at C:\Users\LENOVO\tools\go (prefix PATH per shell). Docker Desktop daemon was NOT running. `gh` CLI is not installed; the repo was created via the REST API using the machine's stored Git Credential Manager credential (token never printed or stored in the repo).
-- GitHub remote: https://github.com/PrathamKapoor/ConvergeDB (origin). Default branch: main.
+- Go toolchain: C:\Users\LENOVO\tools\go (prefix PATH per shell). Docker daemon NOT running. `gh` absent; the repo was created via REST API using the machine's Git Credential Manager credential (never printed).
+- Origin: https://github.com/PrathamKapoor/ConvergeDB (main). Never force-push.
 
 ## 12. Agent Instructions
-- Read decisions.md + flow.md first; keep them updated in the same step as changes (Rules 1–6 of Appendix A). Run `go test -race ./...` before any commit that touches node/api/store. Never lower an assertion to make a suite green — record the real cause (docs/FAILURE_LOG.md). Update handoff.md before stopping.
+- Maintain decisions.md/flow.md in the same step as changes (Rules 1–6). Any merge-related change needs differential or permutation evidence. The scan oracle (MissingOpsForScan) and inventoryFromScan MUST stay in sync with the incremental paths — extend the differential tests when touching them. Keep the fail-closed fallbacks: checkpoints and every ingestion path must degrade to full replay, never to wrong state.

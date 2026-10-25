@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -812,4 +814,20 @@ const maxIdempotencyRows = 10000
 // corruption); application code must never use it.
 func (s *Store) ExecRaw(query string, args ...any) (sql.Result, error) {
 	return s.db.Exec(query, args...)
+}
+
+// Backup produces a consistent, standalone snapshot of the database at
+// outPath via SQLite's VACUUM INTO (safe while the store is open, including
+// under WAL). The backup includes the replica identity: restoring it restores
+// THE SAME replica. Bootstrap a different replica from a backup by opening
+// the restored file, then consciously re-identifying it (rare, documented in
+// docs/OPERATIONS.md) — never implicitly.
+func (s *Store) Backup(outPath string) error {
+	if dir := filepath.Dir(outPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	_, err := s.db.Exec(`VACUUM INTO ?`, filepath.ToSlash(outPath))
+	return err
 }

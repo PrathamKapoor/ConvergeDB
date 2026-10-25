@@ -135,7 +135,7 @@ async function call<T>(base: string, path: string, init?: RequestInit): Promise<
 export const api = {
   nodeInfo: (base: string) => call<NodeInfo>(base, "/api/v1/node"),
   documents: (base: string) =>
-    call<{ documents: DocumentView[] }>(base, "/api/v1/documents"),
+    call<{ documents: DocumentView[]; truncated: boolean }>(base, "/api/v1/documents?limit=200"),
   document: (base: string, id: string) =>
     call<{ document: DocumentView }>(base, `/api/v1/documents/${id}`),
   createDocument: (base: string, id: string, title: string) =>

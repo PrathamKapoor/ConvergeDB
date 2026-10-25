@@ -71,10 +71,13 @@ docker compose up --build
 ## Tests
 
 ```bash
-go test ./...            # 48 tests: units, store, HTTP replication, hardening
+go test ./...            # 60 tests: units, store, HTTP replication, hardening, adversarial scenarios
 go test -race ./...      # concurrency-clean
 go test ./tests/model    # exhaustive permutation + randomized exchange model checks
+go test ./tests/adversarial -v   # scale harness, 10-node fault scenarios, kill-mid-burst, checkpoints, backup
 ```
+
+The second-pass audit measured and removed the O(N) anti-entropy scans (pull/inventory costs are now flat vs log size) and added verified materializer checkpoints (startup 1.55 s → 381 ms at 100k ops). Evidence: [docs/BENCHMARKS.md](docs/BENCHMARKS.md), [docs/audit/FINDINGS.md](docs/audit/FINDINGS.md).
 
 ## The data model (deliberately narrow)
 
@@ -99,7 +102,7 @@ Everything travels as **operations** (`doc.create`, `field.set`, `label.add`, `l
 - **Power-loss durability is not tested.** Process-kill durability is. `synchronous=FULL` is the right setting, but only your OS/hardware can make real fsync promises.
 - **Benchmarks are single-machine.** See [docs/RESULTS.md](docs/RESULTS.md) for measured numbers and an explicit `NOT MEASURED` list.
 
-More: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · [docs/SECURITY.md](docs/SECURITY.md) · [docs/TEST_MATRIX.md](docs/TEST_MATRIX.md) · [docs/DEMO.md](docs/DEMO.md) · [docs/COMPARISON.md](docs/COMPARISON.md) · [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md)
+More: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · [docs/SECURITY.md](docs/SECURITY.md) · [docs/TEST_MATRIX.md](docs/TEST_MATRIX.md) · [docs/DEMO.md](docs/DEMO.md) · [docs/COMPARISON.md](docs/COMPARISON.md) · [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md) · [docs/BENCHMARKS.md](docs/BENCHMARKS.md) · [docs/SCALABILITY.md](docs/SCALABILITY.md) · [docs/OPERATIONS.md](docs/OPERATIONS.md) · [docs/audit/FINDINGS.md](docs/audit/FINDINGS.md)
 
 ## License
 

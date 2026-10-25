@@ -27,6 +27,8 @@ func main() {
 		err = cmdBench(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
+	case "admin":
+		err = cmdAdmin(os.Args[2:])
 	case "version", "--version":
 		fmt.Println("convergedb " + version)
 	default:
@@ -51,6 +53,7 @@ Usage:
   convergedb inspect --node http://127.0.0.1:8101 [--document doc-id]
   convergedb verify --nodes alpha=http://127.0.0.1:8101,... --out report.json
   convergedb bench --writes 500 --out ./var/bench
+  convergedb admin backup --db ./var/alpha.db --out ./var/backups/alpha.db.bak
   convergedb doctor
 
 Run 'convergedb <command> -h' for command options.
